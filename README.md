@@ -84,11 +84,39 @@ Limits (`http::Limits`): 64 KiB of head (431), 8 KiB of request line
 (414), 128 field lines (431), 4 KiB of extensions on a chunk line, 16 KiB
 of trailer.
 
+## Tools
+
+`tools/httpd.goose` (goose-httpd) serves static files over HTTP/1.1, plain
+or HTTPS through tlsgoose (`--tls-max 1.2` holds it to TLS 1.2), on
+127.0.0.1 unless told otherwise, one process a connection; GET and HEAD,
+and POST /echo. Paths are percent-decoded once, refuse `..` segments and
+NUL, and must resolve, symbolic links followed, inside the root.
+`tools/http.goose` (goose-http) is a client of http and https URLs,
+keeping a connection for URLs of one origin, checking certificates
+against `--cacert` or the system's roots.
+
+```bash
+goose build tools/httpd.goose && tools/goose-httpd --root site --port 8080 [--cert c.pem --key k.pem --tls-max 1.2]
+goose build tools/http.goose && tools/goose-http [-X M] [-d DATA] [-H 'N: v'] [-i] [--chunked] [--cacert c.pem] URL...
+```
+
 ## Tests
 
 ```bash
 python3 scripts/run_tests.py [--native]        # test/*.goose at -O0, -O2, --debug (and natively)
 python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
+```
+
+`interop.py` runs goose-httpd against curl (OpenSSL's, for TLS 1.3),
+Go's net/http client and Python's http.client, and goose-http against
+Go's net/http server and a Python HTTP/1.0 server, each over TCP, TLS 1.2
+and TLS 1.3, all on 127.0.0.1: files up to 1 MiB, HEAD, 301, 404, 405,
+bodies of 0 to 1 MiB with lengths and chunked, Expect: 100-continue,
+connection reuse, Connection: close, trailers, bodies to the close, ALPN
+http/1.1, and raw bytes (pipelining, CL with TE, bare LF, a 64 KiB head).
+
+```bash
+python3 scripts/interop.py [-k NAME]
 ```
 
 `h1_differential.py` generates requests that vary what smuggling turns on

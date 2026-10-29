@@ -89,6 +89,10 @@ fn server_conn(opt: ServerOptions) -> ServerConn {
 
 fn closing(c: const ServerConn&) -> bool { c.state == SV_CLOSING }
 
+// Whether the request being answered has been read whole: after a
+// REQUEST event without a body, or after END.
+fn request_complete(c: const ServerConn&) -> bool { c.request_done && c.state != SV_HEAD }
+
 // An error answer, then no more requests.
 fn server_fail(c: ServerConn&, status: i64, out: u8[>..]&) -> Event {
     var f: u8[>..] = [];
