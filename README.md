@@ -8,6 +8,7 @@ writes byte strings, and the caller owns the sockets.
 |---|---|
 | `http` | RFC 9110's syntax: tokens, field names and values, fields of a parsed message, status codes, building field sections |
 | `http.h1` | RFC 9112: request and response heads, body framing (§6.3), the chunked coding (§7.1), writing messages |
+| `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
 import http from "../httpgoose.git";
@@ -23,6 +24,27 @@ if n > 0 && http::check_request(buf, h) == 0 {
 
 A parsed head holds positions in the caller's buffer, not copies, and
 nothing in the package keeps a large buffer inside a struct.
+
+A server connection, the caller keeping the bytes that arrive:
+
+```goose
+import http.conn1;
+
+var c = http::server_conn(http::server_options());
+let ev, h = http::server_read(c, buf, body, trailer, out);
+// EV_REQUEST (h's spans point into buf), EV_BODY, EV_END, EV_NEED_MORE,
+// EV_WAIT (answer this request first), EV_ERROR (out holds the answer)
+// then drop ev.used bytes from buf
+http::server_respond(c, 200, fields, length, out);   // length -1: chunked
+http::server_body(c, data, out);
+http::server_end(c, trailer_fields, out);           // then http::closing(c)?
+```
+
+A connection reads the next request only after the response to the one
+before has ended, so pipelined requests are answered in order. It closes
+after a response that ended before its request's body was read (so no
+unread body is taken for a request), after HTTP/1.0 without keep-alive,
+Connection: close from either side, and every error.
 
 ## Strictness
 
