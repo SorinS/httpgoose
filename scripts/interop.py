@@ -129,7 +129,10 @@ def curl_cases(port, tls, ca):
     if tls:
         rc, out, err = run([CURL, *opts, "-v", "-o", "/dev/null", base + "/index.html"])
         e = err.decode()
-        check(f"{tag}: TLS {tls} and ALPN http/1.1", f"TLSv{tls}" in e and "ALPN: server accepted http/1.1" in e, e[-300:])
+        # curl 8 writes "ALPN: server accepted http/1.1", 7.x "ALPN, server
+        # accepted to use http/1.1".
+        alpn = re.search(r"ALPN[:,] server accepted (to use )?http/1\.1", e) is not None
+        check(f"{tag}: TLS {tls} and ALPN http/1.1", f"TLSv{tls}" in e and alpn, e[-300:])
 
 
 def python_cases(port, tls, ca):
