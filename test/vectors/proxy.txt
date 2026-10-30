@@ -1,0 +1,82 @@
+# golang.org/x/net v0.58.0 http/httpproxy tables, as that package answers them (go version go1.27.1 darwin/arm64); scripts/gen_proxy_vectors.py
+proxy	127.0.0.1:8080	-	-	0	http://example.com	http://127.0.0.1:8080
+proxy	cache.corp.example.com:1234	-	-	0	http://example.com	http://cache.corp.example.com:1234
+proxy	cache.corp.example.com	-	-	0	http://example.com	http://cache.corp.example.com
+proxy	localhost	-	-	0	http://example.com	http://localhost
+proxy	https://cache.corp.example.com	-	-	0	http://example.com	https://cache.corp.example.com
+proxy	http://127.0.0.1:8080	-	-	0	http://example.com	http://127.0.0.1:8080
+proxy	https://127.0.0.1:8080	-	-	0	http://example.com	https://127.0.0.1:8080
+proxy	socks5://127.0.0.1	-	-	0	http://example.com	socks5://127.0.0.1
+proxy	foo://host	-	-	0	http://example.com	foo://host
+proxy	http.proxy.tld	secure.proxy.tld	-	0	http://insecure.tld/	http://http.proxy.tld
+proxy	http.proxy.tld	secure.proxy.tld	-	0	https://secure.tld/	http://secure.proxy.tld
+proxy	http.proxy.tld	https://secure.proxy.tld	-	0	https://secure.tld/	https://secure.proxy.tld
+proxy	http.proxy.tld	-	-	0	https://secure.tld/	-
+proxy	http.proxy.tld	-	-	0	ftp://insecure.tld/	-
+proxy	http://10.1.2.3:8080	-	-	1	http://example.com	err
+proxy	-	https://secure.proxy.tld	-	1	https://secure.tld/	https://secure.proxy.tld
+proxy	-	-	-	0	http://example.com	-
+proxy	proxy	-	example.com	0	http://example.com/	-
+proxy	proxy	-	.example.com	0	http://example.com/	http://proxy
+proxy	proxy	-	ample.com	0	http://example.com/	http://proxy
+proxy	proxy	-	example.com	0	http://foo.example.com/	-
+proxy	proxy	-	.foo.com	0	http://example.com/	http://proxy
+proxy	proxy	-	.示例.com	0	http://www.示例.com	-
+proxy	proxy	-	xn--fsq092h.com	0	http://www.示例.com	-
+proxy	proxy	-	示例.com	0	http://www.xn--fsq092h.com	-
+proxy	proxy	-	example.com	0	http://[1000::%25.example.com]:123	http://proxy
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	localhost:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	127.0.0.1:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	127.0.0.2:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[::1]:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[::2]:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	192.168.1.1:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	192.168.1.2:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	192.168.1.3:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	192.168.1.4:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	10.0.0.2:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[2001:db8::52:0:1]:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[2001:db8::52:0:2]:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[2001:db8::52:0:3]:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[2002:db8:a::123]:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	[fe80::424b:c8be:1643:a1b6]:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	barbaz.net:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	www.barbaz.net:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	foobar.com:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	www.foobar.com:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	foofoobar.com:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	baz.com:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	localhost.net:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	local.localhost:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	barbarbaz.net:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	wildcard.io:80	true
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	nested.wildcard.io:80	false
+use	foobar.com, .barbaz.net, *.wildcard.io, 192.168.1.1, 192.168.1.2:81, 192.168.1.3:80, 10.0.0.0/30, 2001:db8::52:0:1, [2001:db8::52:0:2]:443, [2001:db8::52:0:3]:80, 2002:db8:a::45/64	awildcard.io:80	true
+use	*	localhost:80	false
+use	*	127.0.0.1:80	false
+use	*	127.0.0.2:80	false
+use	*	[::1]:80	false
+use	*	[::2]:80	false
+use	*	192.168.1.1:80	false
+use	*	192.168.1.2:80	false
+use	*	192.168.1.3:80	false
+use	*	192.168.1.4:80	false
+use	*	10.0.0.2:80	false
+use	*	[2001:db8::52:0:1]:80	false
+use	*	[2001:db8::52:0:2]:80	false
+use	*	[2001:db8::52:0:3]:80	false
+use	*	[2002:db8:a::123]:80	false
+use	*	[fe80::424b:c8be:1643:a1b6]:80	false
+use	*	barbaz.net:80	false
+use	*	www.barbaz.net:80	false
+use	*	foobar.com:80	false
+use	*	www.foobar.com:80	false
+use	*	foofoobar.com:80	false
+use	*	baz.com:80	false
+use	*	localhost.net:80	false
+use	*	local.localhost:80	false
+use	*	barbarbaz.net:80	false
+use	*	wildcard.io:80	false
+use	*	nested.wildcard.io:80	false
+use	*	awildcard.io:80	false
+use	:1	example.com:80	true

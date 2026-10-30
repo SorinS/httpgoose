@@ -116,6 +116,9 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
 python3 scripts/run_tests.py [--native]        # test/*.goose at -O0, -O2, --debug (and natively)
 python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
 python3 scripts/url_differential.py [--seed N] [--random N] [-v]
+python3 scripts/flate_differential.py [--seed N] [--count N] [-v]
+python3 scripts/gen_cookie_vectors.py      # Go's cookiejar tables -> test/vectors/cookiejar*.txt
+python3 scripts/gen_proxy_vectors.py       # x/net's httpproxy tables -> test/vectors/proxy.txt
 ```
 
 `url_differential.py` parses every string literal of Go's net/url tests,
@@ -133,6 +136,27 @@ and TLS 1.3, all on 127.0.0.1: files up to 1 MiB, HEAD, 301, 404, 405,
 bodies of 0 to 1 MiB with lengths and chunked, Expect: 100-continue,
 connection reuse, Connection: close, trailers, bodies to the close, ALPN
 http/1.1, and raw bytes (pipelining, CL with TE, bare LF, a 64 KiB head).
+
+Then the client's policy, through goose-http: Go's table of redirect
+methods (TestClientRedirectTypes: six methods, five statuses, and whether
+the body is sent again), redirect chains and limits, the fields dropped
+on a redirect to another host, Referer; cookies against curl's (what is
+sent, the cookies.txt written, curl's file read back); Basic, Bearer, a
+URL's userinfo, and Digest (MD5, SHA-256, SHA-256-sess, SHA-512-256,
+userhash, auth-int) against a Python server that curl --digest is run
+against too; gzip whole, cut short and over TLS; a timeout; and proxies:
+Go's forward proxy (absolute-form, CONNECT, one tunnel kept for three
+requests, 407s, credentials, the proxy over TLS with TLS inside it), a
+SOCKS5 server (by name, IPv6, RFC 1929's password), HTTP_PROXY,
+HTTPS_PROXY, NO_PROXY, the loopback and CGI rules, and --noproxy. The
+proxies reach a made-up host, origin.test, that only they resolve, which
+shows the client sends the name.
+
+`test/fetch.goose` checks proxy selection against golang.org/x/net's
+httpproxy tables (scripts/gen_proxy_vectors.py runs them through that
+package). Where this client parts from Go's on purpose: an http request
+in a CGI program (REQUEST_METHOD set) goes directly where Go refuses it;
+of two cookies with one path, both send the older first, curl the newer.
 
 ```bash
 python3 scripts/interop.py [-k NAME]

@@ -2,19 +2,35 @@
 //
 //	gointerop server -addr 127.0.0.1:0 [-cert c.pem -key k.pem -tlsmax 1.2|1.3]
 //	gointerop client -base URL [-cacert c.pem -tlsmax 1.2|1.3]
+//	gointerop proxy -addr 127.0.0.1:0 [-auth user:pass] [-cert c.pem -key k.pem] [-map host=addr,...]
+//	gointerop socks5 -addr 127.0.0.1:0 [-auth user:pass] [-map host=addr,...]
 //
 // The server prints "listening ADDR" and serves /hello, /chunked,
-// /trailer, /big, /echo, /status/N and /close. The client checks
-// goose-httpd: files, HEAD, 404, bodies of several sizes, chunked
-// uploads, connection reuse, and the TLS version; one "ok NAME" or
-// "FAIL NAME: why" a line, exit status 1 if any failed.
+// /trailer, /big, /echo, /status/N and /close, and for goose-http's
+// policy: /redir?status=N&to=URL, /chain/N, /inspect (what arrived:
+// method, body length, fields), /setcookie?c=LINE..., /cookies, /basic
+// and /bearer (credentials alice:secret, token tok123), /gzip and
+// /gzip-bad (a 1 MiB body gzipped, and cut short), /slow (3 s). The
+// client checks goose-httpd: files, HEAD, 404, bodies of several sizes,
+// chunked uploads, connection reuse, and the TLS version; one "ok NAME"
+// or "FAIL NAME: why" a line, exit status 1 if any failed.
+//
+// The proxy is a forward HTTP proxy (absolute-form requests, and CONNECT),
+// over TLS with -cert; socks5 a SOCKS5 server (RFC 1928, RFC 1929's
+// password with -auth). Both connect names in -map to the address given
+// there (so a made-up name reaches a server on 127.0.0.1), and print a
+// line a request: "proxy METHOD TARGET" or "socks CONNECT HOST:PORT".
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -22,11 +38,14 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-const version = "gointerop 1"
+const version = "gointerop 2"
 
 func big() []byte {
 	b := make([]byte, 1<<20)
@@ -75,6 +94,7 @@ func serve(addr, cert, key, tlsmax string) {
 		w.Header().Set("Connection", "close")
 		io.WriteString(w, "closing")
 	})
+	policy(mux)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gointerop:", err)
@@ -224,13 +244,301 @@ func client(base, cacert, tlsmax string) {
 	}
 }
 
+// The endpoints that goose-http's redirects, cookies, credentials and
+// gzip are checked against.
+func policy(mux *http.ServeMux) {
+	mux.HandleFunc("/redir", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		n, _ := strconv.Atoi(r.URL.Query().Get("status"))
+		w.Header().Set("Location", r.URL.Query().Get("to"))
+		w.WriteHeader(n)
+	})
+	mux.HandleFunc("/chain/", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/chain/"))
+		if n <= 0 {
+			io.WriteString(w, "chain end")
+			return
+		}
+		http.Redirect(w, r, "/chain/"+strconv.Itoa(n-1), http.StatusFound)
+	})
+	mux.HandleFunc("/inspect", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Method", r.Method)
+		w.Header().Set("X-Body", strconv.Itoa(len(b)))
+		var names []string
+		for k := range r.Header {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		fmt.Fprintf(w, "method %s\nbody %d %s\nhost %s\n", r.Method, len(b), b, r.Host)
+		for _, k := range names {
+			fmt.Fprintf(w, "%s: %s\n", k, strings.Join(r.Header[k], ", "))
+		}
+	})
+	mux.HandleFunc("/setcookie", func(w http.ResponseWriter, r *http.Request) {
+		for _, c := range r.URL.Query()["c"] {
+			w.Header().Add("Set-Cookie", c)
+		}
+		io.WriteString(w, "set")
+	})
+	mux.HandleFunc("/cookies", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Header.Get("Cookie"))
+	})
+	mux.HandleFunc("/basic", func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || u != "alice" || p != "secret" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="go", charset="UTF-8"`)
+			w.WriteHeader(401)
+			io.WriteString(w, "who are you")
+			return
+		}
+		io.WriteString(w, "hello alice")
+	})
+	mux.HandleFunc("/bearer", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok123" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="go"`)
+			w.WriteHeader(401)
+			return
+		}
+		io.WriteString(w, "token ok")
+	})
+	mux.HandleFunc("/gzip", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Write(big())
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		zw.Write(big())
+		zw.Close()
+	})
+	mux.HandleFunc("/gzip-bad", func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		zw.Write(big())
+		zw.Close()
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(buf.Bytes()[:buf.Len()-10])
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		io.WriteString(w, "slow")
+	})
+}
+
+// The address a name in -map stands for, else the address itself.
+type dialMap map[string]string
+
+func (m dialMap) addr(hostport string) string {
+	if a, ok := m[hostport]; ok {
+		return a
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err == nil {
+		if a, ok := m[host]; ok {
+			_, mport, _ := net.SplitHostPort(a)
+			if mport == "" {
+				return net.JoinHostPort(a, port)
+			}
+			return a
+		}
+	}
+	return hostport
+}
+
+func parseMap(s string) dialMap {
+	m := dialMap{}
+	for _, kv := range strings.Split(s, ",") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+var logMu sync.Mutex
+
+func logLine(format string, a ...any) {
+	logMu.Lock()
+	fmt.Printf(format+"\n", a...)
+	os.Stdout.Sync()
+	logMu.Unlock()
+}
+
+func proxyServe(addr, auth, cert, key string, m dialMap) {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, a string) (net.Conn, error) {
+			return net.Dial(network, m.addr(a))
+		},
+		Proxy: nil,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := r.RequestURI
+		if auth != "" {
+			want := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+			if r.Header.Get("Proxy-Authorization") != want {
+				logLine("proxy %s %s refused", r.Method, target)
+				w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
+				w.WriteHeader(407)
+				return
+			}
+		}
+		logLine("proxy %s %s", r.Method, target)
+		if r.Method == "CONNECT" {
+			up, err := net.Dial("tcp", m.addr(r.Host))
+			if err != nil {
+				w.WriteHeader(502)
+				return
+			}
+			hj, _ := w.(http.Hijacker)
+			conn, brw, err := hj.Hijack()
+			if err != nil {
+				up.Close()
+				return
+			}
+			conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+			go func() { io.Copy(up, brw); up.Close() }()
+			io.Copy(conn, up)
+			conn.Close()
+			return
+		}
+		if r.URL.Scheme == "" {
+			w.WriteHeader(400)
+			return
+		}
+		out := r.Clone(context.Background())
+		out.RequestURI = ""
+		out.Header.Del("Proxy-Authorization")
+		out.Header.Del("Proxy-Connection")
+		resp, err := tr.RoundTrip(out)
+		if err != nil {
+			w.WriteHeader(502)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gointerop:", err)
+		os.Exit(1)
+	}
+	fmt.Println("listening", ln.Addr().String())
+	os.Stdout.Sync()
+	srv := &http.Server{Handler: h}
+	if cert != "" {
+		srv.TLSConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+		err = srv.ServeTLS(ln, cert, key)
+	} else {
+		err = srv.Serve(ln)
+	}
+	fmt.Fprintln(os.Stderr, "gointerop:", err)
+	os.Exit(1)
+}
+
+func socksServe(addr, auth string, m dialMap) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gointerop:", err)
+		os.Exit(1)
+	}
+	fmt.Println("listening", ln.Addr().String())
+	os.Stdout.Sync()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go socksConn(c, auth, m)
+	}
+}
+
+func socksConn(c net.Conn, auth string, m dialMap) {
+	defer c.Close()
+	br := bufio.NewReader(c)
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(br, hdr); err != nil || hdr[0] != 5 {
+		return
+	}
+	methods := make([]byte, hdr[1])
+	io.ReadFull(br, methods)
+	want := byte(0)
+	if auth != "" {
+		want = 2
+	}
+	if !bytes.Contains(methods, []byte{want}) {
+		c.Write([]byte{5, 0xff})
+		logLine("socks refused: no acceptable method")
+		return
+	}
+	c.Write([]byte{5, want})
+	if want == 2 {
+		v := make([]byte, 2)
+		io.ReadFull(br, v)
+		u := make([]byte, v[1])
+		io.ReadFull(br, u)
+		pl := make([]byte, 1)
+		io.ReadFull(br, pl)
+		p := make([]byte, pl[0])
+		io.ReadFull(br, p)
+		if string(u)+":"+string(p) != auth {
+			c.Write([]byte{1, 1})
+			logLine("socks refused: bad password")
+			return
+		}
+		c.Write([]byte{1, 0})
+	}
+	req := make([]byte, 4)
+	if _, err := io.ReadFull(br, req); err != nil || req[0] != 5 || req[1] != 1 {
+		return
+	}
+	var host string
+	switch req[3] {
+	case 1:
+		a := make([]byte, 4)
+		io.ReadFull(br, a)
+		host = net.IP(a).String()
+	case 4:
+		a := make([]byte, 16)
+		io.ReadFull(br, a)
+		host = net.IP(a).String()
+	case 3:
+		l := make([]byte, 1)
+		io.ReadFull(br, l)
+		a := make([]byte, l[0])
+		io.ReadFull(br, a)
+		host = string(a)
+	default:
+		return
+	}
+	pb := make([]byte, 2)
+	io.ReadFull(br, pb)
+	target := net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(pb))))
+	logLine("socks CONNECT %s", target)
+	up, err := net.Dial("tcp", m.addr(target))
+	if err != nil {
+		c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer up.Close()
+	c.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
+	go func() { io.Copy(up, br); up.Close() }()
+	io.Copy(c, up)
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		fmt.Println(version)
 		return
 	}
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: gointerop server|client ...")
+		fmt.Fprintln(os.Stderr, "usage: gointerop server|client|proxy|socks5 ...")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -240,14 +548,20 @@ func main() {
 	tlsmax := fs.String("tlsmax", "1.3", "the TLS version: 1.2 or 1.3")
 	base := fs.String("base", "", "the server's base URL")
 	cacert := fs.String("cacert", "", "roots for the server's certificate (PEM)")
+	auth := fs.String("auth", "", "proxy credentials, user:pass")
+	maps := fs.String("map", "", "host=addr,... for the proxies")
 	fs.Parse(os.Args[2:])
 	switch os.Args[1] {
 	case "server":
 		serve(*addr, *cert, *key, *tlsmax)
 	case "client":
 		client(*base, *cacert, *tlsmax)
+	case "proxy":
+		proxyServe(*addr, *auth, *cert, *key, parseMap(*maps))
+	case "socks5":
+		socksServe(*addr, *auth, parseMap(*maps))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: gointerop server|client ...")
+		fmt.Fprintln(os.Stderr, "usage: gointerop server|client|proxy|socks5 ...")
 		os.Exit(2)
 	}
 }

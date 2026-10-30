@@ -561,8 +561,11 @@ fn use_proxy(c: const Client&, host: const u8[:], port: i64, loopback_rule: bool
     format(port_text, port);
     var use = true;
     each_split(c.no_proxy, ',') {
-        var p: u8[>..] = [];
-        for ch in trim_ows(it) { p.push(lower(ch)); }
+        var low: u8[>..] = [];
+        for ch in trim_ows(it) { low.push(lower(ch)); }
+        // An entry outside ASCII in its ASCII form (Go's idnaASCII).
+        var p, aok = to_ascii_host(low);
+        if !aok { p.clear(); }
         if use && p.len > 0 {
             if p[..] == "*" { use = false; }
             // "host:port", "[v6]:port", or a host; a CIDR block "ip/bits".
@@ -629,6 +632,8 @@ fn cidr_contains(p: const u8[:], ip: const u8[:], kind: i64) -> bool {
 fn proxy_for(c: const Client&, u: const Url&) -> u8[>..] {
     var out: u8[>..] = [];
     if c.proxy_mode == PROXY_NONE { return out; }
+    let sc = url_scheme(u);
+    if sc != "http" && sc != "https" { return out; }
     let https = url_https(u);
     let p = if https { c.proxy_https[..] } else { c.proxy_http[..] };
     if p.len == 0 { return out; }
@@ -1097,8 +1102,9 @@ fn read_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
             r.body_done = true;
             return -ERR_DECODE;
         }
-        if out.len > before { return out.len - before; }
+        // The body ended: the gzip stream must have ended whole with it.
         if r.body_done && !inflate_done(c.inflate) { return -ERR_DECODE; }
+        if out.len > before { return out.len - before; }
         if r.body_done { return 0; }
     }
     return 0;

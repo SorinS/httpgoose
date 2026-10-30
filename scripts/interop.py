@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """HTTP/1.1 interop on 127.0.0.1: goose-httpd against curl, Go's net/http
 and Python's http.client, and goose-http against Go's net/http server and
-a Python HTTP/1.0 server; each over TCP and TLS 1.2 and 1.3.
+a Python HTTP/1.0 server; each over TCP and TLS 1.2 and 1.3. Then
+goose-http's policy (http.fetch): Go's table of redirect methods,
+redirects across hosts, cookies (against curl's for the same exchanges),
+Basic, Bearer and Digest credentials (a Python Digest server that curl
+--digest is run against too), gzip, timeouts, and proxies: Go's forward
+proxy (absolute-form, CONNECT, with and without credentials, over TLS
+too), a SOCKS5 server, and the proxy environment.
 
     python3 scripts/interop.py [--goose PATH] [-k NAME]
 
@@ -230,6 +236,242 @@ def goose_client_cases(gh, port, tls, ca, tag):
     check(f"{tag}: a header with CRLF refused", rc == 2)
 
 
+DIGEST = r"""
+import hashlib, http.server, re, sys
+USER, PASSWORD, REALM = "Mufasa", "Circle of Life", "digest@test"
+NONCE, OPAQUE = "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", "FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"
+ALGS = {"md5": ("MD5", "md5"), "sha256": ("SHA-256", "sha256"), "sha256-sess": ("SHA-256-sess", "sha256"),
+        "sha512-256": ("SHA-512-256", "sha512_256"), "authint": ("SHA-256", "sha256"), "userhash": ("SHA-256", "sha256")}
+def H(alg, s):
+    return hashlib.new(alg, s.encode()).hexdigest()
+def params(v):
+    out = {}
+    for m in re.finditer(r'([A-Za-z0-9*-]+)\s*=\s*("((?:[^"\\]|\\.)*)"|[^,\s]+)', v):
+        out[m.group(1).lower()] = re.sub(r'\\(.)', r'\1', m.group(3)) if m.group(3) is not None else m.group(2)
+    return out
+class D(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def handle_any(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        kind = self.path.rsplit("/", 1)[-1]
+        name, alg = ALGS.get(kind, ALGS["sha256"])
+        qop = "auth-int" if kind == "authint" else "auth"
+        a = self.headers.get("Authorization", "")
+        ok = False
+        if a.startswith("Digest "):
+            p = params(a[7:])
+            user = p.get("username")
+            if kind == "userhash":
+                ok_user = user == H(alg, USER + ":" + REALM) and p.get("userhash") == "true"
+            else:
+                ok_user = user == USER
+            ha1 = H(alg, USER + ":" + REALM + ":" + PASSWORD)
+            if name.endswith("-sess"):
+                ha1 = H(alg, ha1 + ":" + NONCE + ":" + p.get("cnonce", ""))
+            a2 = self.command + ":" + p.get("uri", "")
+            if qop == "auth-int":
+                a2 += ":" + hashlib.new(alg, body).hexdigest()
+            want = H(alg, ":".join([ha1, NONCE, p.get("nc", ""), p.get("cnonce", ""), qop, H(alg, a2)]))
+            ok = (ok_user and p.get("nonce") == NONCE and p.get("realm") == REALM and p.get("qop") == qop and
+                  p.get("opaque") == OPAQUE and p.get("uri") == self.path and p.get("response") == want)
+        if ok:
+            out = b"digest ok"
+            self.send_response(200)
+        else:
+            out = b"digest wanted"
+            self.send_response(401)
+            ch = f'Digest realm="{REALM}", qop="{qop}", algorithm={name}, nonce="{NONCE}", opaque="{OPAQUE}"'
+            if kind == "userhash":
+                ch += ", userhash=true"
+            self.send_header("WWW-Authenticate", 'Basic realm="nope"')
+            self.send_header("WWW-Authenticate", ch)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    do_GET = do_POST = handle_any
+    def log_message(self, *a): pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), D)
+print("listening", s.server_address[1], flush=True)
+s.serve_forever()
+"""
+
+
+def fetch_cases(gh, gi, cert, g0, g13, dg, env_base):
+    """goose-http's policy: redirects, cookies, credentials, gzip, proxies."""
+    plain = f"http://127.0.0.1:{g0}"
+    other = f"http://localhost:{g0}"
+    tls = ["--cacert", cert]
+
+    def gx(*a, env=None, timeout=60):
+        p = subprocess.run([gh, *a], capture_output=True, timeout=timeout, env=env if env is not None else env_base)
+        return p.returncode, p.stdout, p.stderr
+
+    def field(out, name):
+        m = re.search(rb"(?im)^" + name.encode() + rb": *(.*?)\r?$", out)
+        return m.group(1).decode() if m else None
+
+    # Go's TestClientRedirectTypes: (method, status) -> the next method; 307
+    # and 308 send the body again, 301-303 drop it.
+    for method in ["POST", "HEAD", "GET", "DELETE", "PUT", "MADEUPMETHOD"]:
+        for status in [301, 302, 303, 307, 308]:
+            want = method if status in (307, 308) or method in ("GET", "HEAD") else "GET"
+            data = [] if method in ("GET", "HEAD") else ["-d", "payload"]
+            rc, out, err = gx("-L", "-i", "-X", method, *data, f"{plain}/redir?status={status}&to=/inspect")
+            body = "7" if status in (307, 308) and data else "0"
+            ok = rc == 0 and field(out, "X-Method") == want and field(out, "X-Body") == body
+            check(f"redirect: {method} then {status} -> {want}, body {body}", ok, out[:300] + err[:200])
+    rc, out, err = gx("-L", f"{plain}/chain/5")
+    check("redirect: a chain of 5 with -L", rc == 0 and out == b"chain end", out[:100])
+    rc, out, err = gx("-L", "--max-redirs", "3", f"{plain}/chain/5")
+    check("redirect: past --max-redirs fails", rc == 1 and b"too many redirects" in err, err[:200])
+    rc, out, err = gx("-i", f"{plain}/chain/5")
+    check("redirect: not followed without -L", rc == 0 and out.startswith(b"HTTP/1.1 302 Found") and b"Location: /chain/4" in out)
+    hdrs = ["-H", "Authorization: Bearer x", "-H", "Cookie: a=1", "-H", "X-Keep: 1"]
+    rc, out, err = gx("-L", *hdrs, f"{plain}/redir?status=302&to={other}/inspect")
+    check("redirect: to another host drops Authorization and Cookie, keeps others, sends Referer",
+          rc == 0 and b"host localhost:" in out and b"\nAuthorization:" not in out and b"\nCookie:" not in out and
+          b"X-Keep: 1" in out and f"Referer: {plain}/redir?status=302&to={other}/inspect".encode() in out, out[:400])
+    rc, out, err = gx("-L", *hdrs, f"{plain}/redir?status=302&to=/inspect")
+    check("redirect: on one host keeps Authorization and Cookie",
+          rc == 0 and b"Authorization: Bearer x" in out and b"Cookie: a=1" in out, out[:400])
+    rc, out, err = gx("-L", *tls, f"https://localhost:{g13}/redir?status=302&to={plain}/inspect")
+    check("redirect: no Referer from https to http", rc == 0 and b"method GET" in out and b"Referer" not in out, out[:400])
+    rc, out, err = gx("-L", "-d", "x", f"{plain}/redir?status=303&to=/inspect")
+    check("redirect: 303 drops Content-Type with the body", rc == 0 and b"Content-Type" not in out and b"method GET" in out, out[:300])
+
+    # Cookies, and curl's jar for the same exchanges.
+    sets = "c=a%3D1&c=b%3D2%3B%20Path%3D%2Fcookies&c=gone%3D1&c=gone%3Dx%3B%20Max-Age%3D0&c=q%3D%22v%20w%22"
+    with tempfile.TemporaryDirectory() as d:
+        gj, cj = os.path.join(d, "goose.txt"), os.path.join(d, "curl.txt")
+        rc, out, err = gx("-c", gj, "-b", "", f"{plain}/setcookie?{sets}", f"{plain}/cookies", f"{plain}/inspect")
+        crc, cout, cerr = run([CURL, "-s", "-c", cj, "-b", "", f"{plain}/setcookie?{sets}", f"{plain}/cookies",
+                               f"{plain}/inspect"])
+        # The same cookies; of two with one path, Go and RFC 6265 §5.4 send the
+        # older first, curl the newer, so they are compared as sets.
+        def sent(o):
+            return sorted(o.split(b"method")[0][3:].split(b"; "))
+        check("cookies: the ones curl sends", rc == 0 and sent(out) == sent(cout) and out.startswith(b"setb=2; "),
+              f"goose {out[:120]!r} curl {cout[:120]!r}")
+        def lines(path):
+            return sorted(l for l in open(path).read().splitlines() if l and not l.startswith("# "))
+        check("cookies: the jar file is curl's", rc == 0 and lines(gj) == lines(cj), f"{lines(gj)} vs {lines(cj)}")
+        rc, out, err = gx("-b", cj, f"{plain}/cookies")
+        check("cookies: curl's file read back", rc == 0 and out.startswith(b"b=2; ") and
+              sorted(out.split(b"; ")) == [b"a=1", b"b=2", b'q="v w"'], out[:100])
+        rc, out, err = gx("-c", gj, "-L", f"{plain}/setcookie?c=r%3D1&c=x%3Dy%3B%20Domain%3Dexample.com",
+                          f"{plain}/cookies")
+        check("cookies: a Domain of another site refused", rc == 0 and out == b"setr=1", out[:100])
+        rc, out, err = gx("-b", "", "-L", f"{plain}/redir?status=302&to={other}/cookies")
+        check("cookies: none sent to another host", rc == 0 and out == b"", out[:100])
+
+    # Credentials.
+    rc, out, err = gx("-u", "alice:secret", f"{plain}/basic")
+    check("auth: Basic", rc == 0 and out == b"hello alice", out[:100])
+    rc, out, err = gx("-u", "alice:wrong", f"{plain}/basic")
+    check("auth: Basic refused exits 1", rc == 1 and out == b"who are you", out[:100])
+    rc, out, err = gx("--anyauth", "-u", "alice:secret", f"{plain}/basic")
+    check("auth: --anyauth answers Basic's 401", rc == 0 and out == b"hello alice", out[:100])
+    rc, out, err = gx(f"http://alice:secret@127.0.0.1:{g0}/basic")
+    check("auth: a URL's userinfo", rc == 0 and out == b"hello alice", out[:100])
+    rc, out, err = gx("--oauth2-bearer", "tok123", f"{plain}/bearer")
+    check("auth: Bearer", rc == 0 and out == b"token ok", out[:100])
+    rc, out, err = gx("-L", "-u", "alice:secret", f"{plain}/redir?status=302&to={other}/basic")
+    check("auth: credentials not sent to another host", rc == 1 and out == b"who are you", out[:100])
+    dbase = f"http://127.0.0.1:{dg}/digest"
+    for kind in ["md5", "sha256", "sha256-sess", "sha512-256", "userhash"]:
+        rc, out, err = gx("--digest", "-u", "Mufasa:Circle of Life", f"{dbase}/{kind}")
+        crc, cout, cerr = run([CURL, "-s", "--digest", "-u", "Mufasa:Circle of Life", f"{dbase}/{kind}"])
+        check(f"auth: Digest {kind} (curl: {cout.decode()})", rc == 0 and out == b"digest ok", out[:100] + err[:100])
+    rc, out, err = gx("--digest", "-u", "Mufasa:Circle of Life", "-d", "the body", f"{dbase}/authint")
+    check("auth: Digest auth-int over a body", rc == 0 and out == b"digest ok", out[:100])
+    rc, out, err = gx("--anyauth", "-u", "Mufasa:Circle of Life", f"{dbase}/sha256")
+    check("auth: --anyauth takes Digest over Basic", rc == 0 and out == b"digest ok", out[:100])
+    rc, out, err = gx("--digest", "-u", "Mufasa:wrong", f"{dbase}/sha256")
+    check("auth: Digest refused exits 1", rc == 1, out[:100])
+
+    # gzip.
+    rc, out, err = gx("--compressed", f"{plain}/gzip")
+    check("gzip: decoded", rc == 0 and out == big(), err[:200])
+    rc, out, err = gx("--compressed", "-i", f"{plain}/gzip")
+    check("gzip: Content-Encoding and Content-Length dropped", rc == 0 and b"Content-Encoding" not in out.split(b"\r\n\r\n")[0])
+    rc, out, err = gx("--compressed", f"{plain}/gzip-bad")
+    check("gzip: a body cut short fails", rc == 1, err[:200])
+    rc, out, err = gx("--compressed", *tls, f"https://localhost:{g13}/gzip")
+    check("gzip: over TLS", rc == 0 and out == big(), err[:200])
+
+    # Timeouts.
+    t0 = time.time()
+    rc, out, err = gx("-m", "1", f"{plain}/slow")
+    check("timeout: -m 1 against 3 s", rc == 1 and time.time() - t0 < 2.5 and b"timed out" in err, err[:200])
+
+
+def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
+    go_re = r"listening 127\.0\.0\.1:(\d+)"
+    m = ["-map", "origin.test=127.0.0.1"]
+    px = Server([gi, "proxy", *m], go_re, "stdout")
+    pa = Server([gi, "proxy", "-auth", "u:p", *m], go_re, "stdout")
+    ps = Server([gi, "proxy", "-cert", cert, "-key", cert.replace("cert.pem", "key.pem"), *m], go_re, "stdout")
+    sx = Server([gi, "socks5", *m], go_re, "stdout")
+    sa = Server([gi, "socks5", "-auth", "u:p", *m], go_re, "stdout")
+    servers += [px, pa, ps, sx, sa]
+    tls = ["--cacert", cert]
+    o_http = f"http://origin.test:{g0}/hello"
+    o_https = f"https://origin.test:{g13}/hello"
+
+    def gx(*a, env=None):
+        p = subprocess.run([gh, *a], capture_output=True, timeout=60, env=env if env is not None else env_base)
+        return p.returncode, p.stdout, p.stderr
+
+    def logged(srv, text):
+        time.sleep(0.2)
+        return any(text in l for l in srv.log)
+
+    rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", o_http)
+    check("proxy: http in absolute-form", rc == 0 and out == b"hello" and logged(px, f"proxy GET {o_http}"), err[:200])
+    rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", *tls, o_https)
+    check("proxy: https through CONNECT", rc == 0 and out == b"hello" and logged(px, f"proxy CONNECT origin.test:{g13}"), err[:200])
+    before = sum("CONNECT" in l for l in px.log)
+    rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", *tls, o_https, o_https, o_https)
+    time.sleep(0.2)
+    check("proxy: one tunnel for three requests", rc == 0 and out == b"hello" * 3 and sum("CONNECT" in l for l in px.log) == before + 1)
+    rc, out, err = gx("-x", f"http://127.0.0.1:{pa.port}", o_http)
+    check("proxy: 407 without credentials exits 1", rc == 1, out[:100])
+    rc, out, err = gx("-x", f"http://u:p@127.0.0.1:{pa.port}", o_http)
+    check("proxy: Basic credentials from the proxy URL", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx("-x", f"http://u:p@127.0.0.1:{pa.port}", *tls, o_https)
+    check("proxy: CONNECT with credentials", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx("-x", f"http://127.0.0.1:{pa.port}", *tls, o_https)
+    check("proxy: CONNECT's 407 exits 1", rc == 1, err[:200])
+    rc, out, err = gx("-x", f"https://localhost:{ps.port}", *tls, o_http)
+    check("proxy: an https proxy for http", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx("-x", f"https://localhost:{ps.port}", *tls, o_https)
+    check("proxy: an https proxy for https (TLS in TLS)", rc == 0 and out == b"hello" and logged(ps, f"proxy CONNECT origin.test:{g13}"), err[:200])
+    rc, out, err = gx("-x", f"socks5h://127.0.0.1:{sx.port}", o_http)
+    check("socks5: by name", rc == 0 and out == b"hello" and logged(sx, f"socks CONNECT origin.test:{g0}"), err[:200])
+    rc, out, err = gx("-x", f"socks5://127.0.0.1:{sx.port}", *tls, o_https)
+    check("socks5: https", rc == 0 and out == b"hello" and logged(sx, f"socks CONNECT origin.test:{g13}"), err[:200])
+    rc, out, err = gx("-x", f"socks5://127.0.0.1:{sx.port}", f"http://[::1]:1/")
+    check("socks5: an IPv6 address as one", logged(sx, "socks CONNECT [::1]:1"), err[:200])
+    rc, out, err = gx("-x", f"socks5://u:p@127.0.0.1:{sa.port}", o_http)
+    check("socks5: with RFC 1929's password", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx("-x", f"socks5://u:bad@127.0.0.1:{sa.port}", o_http)
+    check("socks5: a wrong password exits 1", rc == 1, err[:200])
+    env = dict(env_base, HTTP_PROXY=f"http://127.0.0.1:{px.port}", HTTPS_PROXY=f"http://127.0.0.1:{px.port}")
+    rc, out, err = gx(o_http, env=env)
+    check("proxy: HTTP_PROXY", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx(*tls, o_https, env=env)
+    check("proxy: HTTPS_PROXY", rc == 0 and out == b"hello", err[:200])
+    rc, out, err = gx(o_http, env=dict(env, NO_PROXY="origin.test"))
+    check("proxy: NO_PROXY goes direct (origin.test does not resolve)", rc == 1 and b"resolve" in err, err[:200])
+    rc, out, err = gx(f"http://127.0.0.1:{g0}/hello", env=env)
+    check("proxy: never for loopback from the environment", rc == 0 and out == b"hello" and not logged(px, f"127.0.0.1:{g0}/hello"))
+    rc, out, err = gx(o_http, env=dict(env, REQUEST_METHOD="GET"))
+    check("proxy: HTTP_PROXY not used under CGI", rc == 1 and b"resolve" in err, err[:200])
+    rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", "--noproxy", "origin.test", o_http)
+    check("proxy: --noproxy", rc == 1 and b"resolve" in err, err[:200])
+
+
 PY10 = r'''
 import http.server, sys
 class H(http.server.BaseHTTPRequestHandler):
@@ -278,7 +520,7 @@ def main():
         cert, key = os.path.join(tmp, "cert.pem"), os.path.join(tmp, "key.pem")
         subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
                         "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=localhost",
-                        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], check=True, capture_output=True)
+                        "-addext", "subjectAltName=DNS:localhost,DNS:origin.test,IP:127.0.0.1"], check=True, capture_output=True)
         httpd = os.path.join(tmp, "goose-httpd")
         gh = os.path.join(tmp, "goose-http")
         gi = os.path.join(tmp, "gointerop")
@@ -312,6 +554,13 @@ def main():
         servers.append(py)
         rc, out, err = run([gh, f"http://127.0.0.1:{py.port}/", f"http://127.0.0.1:{py.port}/"])
         check("goose-http to python HTTP/1.0: bodies to the close, twice", rc == 0 and out == b"to the close " * 2000, err.decode()[:200])
+        # goose-http's policy, and proxies. No proxy of the caller's environment.
+        env_base = {k: v for k, v in os.environ.items() if k.lower() not in
+                    ("http_proxy", "https_proxy", "no_proxy", "all_proxy", "request_method")}
+        dg = Server([sys.executable, "-c", DIGEST], r"listening (\d+)", "stdout")
+        servers.append(dg)
+        fetch_cases(gh, gi, cert, g0.port, g13.port, dg.port, env_base)
+        proxy_cases(gh, gi, cert, g0.port, g13.port, env_base, servers)
         bad = 0
         for s in servers:
             for l in s.log:
