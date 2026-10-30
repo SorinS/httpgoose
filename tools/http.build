@@ -1,2 +1,1 @@
-c_sources = ["net.c"];
 output = "goose-http";

@@ -117,6 +117,21 @@ goose build tools/httpd.goose && tools/goose-httpd --root site --port 8080 [--ce
 goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v'] [-i] [-u U:P] [-x PROXY] [-b F -c F] [--compressed] URL...
 ```
 
+## Not yet
+
+- HTTP/2.
+- Request bodies are in memory: no streaming upload.
+- One response is read at a time per `Client`.
+- `Client` is a `root struct`, so it can't be returned from a function or
+  kept inside another struct.
+- No TLS session resumption in the client.
+- Digest's `nc` is always 1, so each request answers a fresh challenge.
+- The public suffix lookup scans the list (about 200 KB) on every cookie
+  set or sent.
+- An idle TLS connection that gets a late NewSessionTicket is dropped
+  rather than read, which is safe but closes connections that could have
+  been reused.
+
 ## Tests
 
 ```bash
