@@ -1,0 +1,1169 @@
+// http.client: an HTTP/1.1 client that does the I/O, over TCP or TLS
+// (tlsgoose), as Go's http.Client and Transport: a pool of connections
+// kept open per origin, retrying a request that met a connection the
+// server had closed, timeouts, and responses read whole or as a stream.
+// Connections go directly, through an HTTP proxy (absolute-form requests,
+// or a CONNECT tunnel for https; the proxy itself over TLS too, as Go's
+// https proxies), or through SOCKS5 (RFC 1928, with RFC 1929's password).
+// Redirects, cookies, authentication and the proxy environment are the
+// policy of http.fetch, built on this module.
+//
+//   var c = http::Client { .. };
+//   var r = http::round_trip(c, "GET", u, fields, "");     // u: an http::Url
+//   if r.err == 0 {
+//       var body: u8[>..] = [];
+//       while http::read_body(c, r, body) > 0 {}
+//   }
+//
+// One response is read at a time: open the next after the body of the one
+// before has been read to its end or closed (close_body). The sockets are
+// in src/httpnet.c, built with programs that use this module.
+
+namespace http;
+
+import std;
+import os;
+import http;
+import h1;
+import conn1;
+import url;
+import cookie;
+import flate;
+import tls from "../tlsgoose.git";
+import tls.handshake;
+
+extern fn httpnet_connect(host: const u8[:], port: i32, timeout_ms: i32) -> i64;
+extern fn httpnet_read(fd: i64, buf: u8[:], timeout_ms: i32) -> i64;
+extern fn httpnet_write(fd: i64, data: const u8[:], timeout_ms: i32) -> i64;
+extern fn httpnet_readable(fd: i64) -> i32;
+extern fn httpnet_close(fd: i64);
+
+let NET_EARG: i64 = -1;
+let NET_ERESOLVE: i64 = -2;
+let NET_ECONNECT: i64 = -3;
+let NET_ETIMEOUT: i64 = -4;
+let NET_EIO: i64 = -5;
+
+// A Response's errors.
+let ERR_NONE: i64 = 0;
+let ERR_URL: i64 = 1;               // not an http or https URL with a host
+let ERR_RESOLVE: i64 = 2;           // the host name does not resolve
+let ERR_CONNECT: i64 = 3;           // refused or unreachable
+let ERR_TIMEOUT: i64 = 4;
+let ERR_IO: i64 = 5;                // the connection failed (reset, closed early)
+let ERR_TLS: i64 = 6;               // the TLS handshake or a record failed
+let ERR_PROTOCOL: i64 = 7;          // a response this client cannot read
+let ERR_REQUEST: i64 = 8;           // the request cannot be written (a bad method or field)
+let ERR_TOO_LARGE: i64 = 9;         // the body passed the client's max_body
+let ERR_REDIRECTS: i64 = 10;        // more redirects than max_redirects
+let ERR_PROXY: i64 = 11;            // the proxy refused the tunnel, or its answer was not HTTP
+let ERR_DECODE: i64 = 12;           // a gzip body that does not decode
+let ERR_STATE: i64 = 13;            // a response is still open on this client
+let ERR_AUTH: i64 = 14;             // (not returned: a 401 or 407 comes back as the response)
+
+fn client_error_text(e: i64) -> const u8[:] {
+    if e == ERR_URL { return "not an http or https URL with a host"; }
+    if e == ERR_RESOLVE { return "the host name does not resolve"; }
+    if e == ERR_CONNECT { return "the connection was refused or the host is unreachable"; }
+    if e == ERR_TIMEOUT { return "timed out"; }
+    if e == ERR_IO { return "the connection failed"; }
+    if e == ERR_TLS { return "TLS failed"; }
+    if e == ERR_PROTOCOL { return "the response is not HTTP/1.x this client can read"; }
+    if e == ERR_REQUEST { return "the request cannot be written"; }
+    if e == ERR_TOO_LARGE { return "the body is larger than the client takes"; }
+    if e == ERR_REDIRECTS { return "too many redirects"; }
+    if e == ERR_PROXY { return "the proxy failed"; }
+    if e == ERR_DECODE { return "the body's content coding does not decode"; }
+    if e == ERR_STATE { return "a response is still open on this client"; }
+    if e == ERR_AUTH { return "the credentials were refused"; }
+    return "";
+}
+
+struct ClientOptions {
+    connect_timeout_ms: i64,        // each connection (0: none); Go's Dialer has 30 s
+    read_timeout_ms: i64,           // each read of the response (0: none)
+    timeout_ms: i64,                // a whole request: redirects, connections, reading the body (0: none; Go's Client.Timeout)
+    max_idle: i64,                  // idle connections kept, in all (0: none, every connection closes)
+    max_idle_per_host: i64,         // for one origin (Go's DefaultMaxIdleConnsPerHost: 2)
+    max_body: i64,                  // what read_all takes into memory
+    max_redirects: i64,             // Go stops after 10
+    follow_redirects: bool,
+    compression: bool,              // ask for gzip and decode it (Go's !DisableCompression)
+    insecure: bool,                 // check no certificate (Go's InsecureSkipVerify)
+    cookies: bool,                  // keep cookies in the client's jar and send them (Go's Client.Jar)
+    auth: u8,                       // how the client's credentials are sent: AUTH_*
+    user_agent: u8[..256],          // sent unless the request has one; empty: none
+}
+
+// How a client's credentials (set_credentials) go to servers: Basic before
+// any challenge (as Go sends a URL's userinfo), or only in answer to a 401
+// with the scheme it asks for (Digest, or Basic), or Digest only.
+let AUTH_BASIC: u8 = 1;
+let AUTH_ANY: u8 = 2;
+let AUTH_DIGEST: u8 = 3;
+
+fn client_options() -> ClientOptions {
+    var o = ClientOptions {
+        connect_timeout_ms: 30000, read_timeout_ms: 0, timeout_ms: 0, max_idle: 100, max_idle_per_host: 2,
+        max_body: 1 << 30, max_redirects: 10, follow_redirects: true, compression: true, insecure: false,
+        cookies: false, auth: AUTH_ANY, user_agent: [],
+    };
+    o.user_agent.append("goose-http-client/1.1");
+    return o;
+}
+
+// A connection of the pool: in use, idle, or a free slot.
+struct PoolConn {
+    used: bool,                     // the slot holds a connection
+    idle: bool,                     // in the pool, waiting for a request
+    fd: i64,
+    key: u8[..600],                 // what it reaches: scheme, host, port, and the proxy's
+    is_tls: bool,
+    reused: bool,                   // it has carried a request before this one
+    last_used: i64,                 // clock_ns() when it went idle
+    server_name: u8[..255],
+    outer: i64,                     // the TLS to an https proxy beneath its own (c.outer), or -1
+    via_proxy: bool,                // requests go to an HTTP proxy in absolute-form
+    hc: ClientConn,
+    tc: tls::Conn,
+}
+
+// TLS to an https proxy, under a tunnel's own TLS.
+struct OuterTls { used: bool, server_name: u8[..255], tc: tls::Conn }
+
+// Where requests go: PROXY_NONE directly, PROXY_URL through one proxy for
+// every URL (Go's http.ProxyURL), PROXY_ENV by the environment's
+// HTTP_PROXY, HTTPS_PROXY and NO_PROXY (Go's ProxyFromEnvironment).
+let PROXY_NONE: u8 = 0;
+let PROXY_URL: u8 = 1;
+let PROXY_ENV: u8 = 2;
+
+root struct Client {
+    opt: ClientOptions = client_options(),
+    tlscfg: tls::ClientConfig = tls::client_config("", ""),
+    conns: PoolConn[>..] = [],
+    outer: OuterTls[>..] = [],
+    buf: u8[>..] = [],              // plaintext that has come and is not used yet
+    raw: u8[>..] = [],              // a read from the socket
+    mid: u8[>..] = [],              // an https proxy's plaintext: the tunnel's TLS records
+    wire: u8[>..] = [],             // bytes to send
+    wire2: u8[>..] = [],            // the same, through an https proxy's TLS
+    open: i64 = -1,                 // the slot a response is being read from, or -1
+    deadline: i64 = 0,              // clock_ns() the request must end by, or 0
+    inflate: Inflate = gzip_decoder(),
+    jar: Jar = new_jar(),
+    psl: Psl = empty_psl(),
+    user: u8[>..] = [],             // credentials for servers (set_credentials)
+    password: u8[>..] = [],
+    bearer: u8[>..] = [],           // a token sent as "Bearer" (set_bearer)
+    proxy_mode: u8 = PROXY_NONE,
+    proxy_http: u8[>..] = [],       // the proxies' URLs, as the environment or set_proxy gave them
+    proxy_https: u8[>..] = [],
+    no_proxy: u8[>..] = [],
+    proxy_cgi: bool = false,        // REQUEST_METHOD is set: HTTP_PROXY is not used (Go's rule)
+    proxy_authz: u8[>..] = [],      // the Proxy-Authorization value to send, if any
+    proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
+    proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
+}
+
+// A response, its head and what of the body read_all took. Its parts are
+// spans into `data`: the URL it came from, the head's field lines (each
+// "Name: value\r\n" as received), the trailer's (after a chunked body),
+// and the body.
+struct Response {
+    err: i64,                       // ERR_NONE, or what went wrong (no response then)
+    status: i64,
+    minor: u8,                      // HTTP/1.minor
+    reason: Span,
+    url: Span,
+    fields: Span,
+    trailer: Span,
+    body: Span,
+    redirects: i64,                 // redirects followed to get it
+    conn: i64,                      // the pool slot its body is read from, -1 when done
+    body_done: bool,
+    decode: bool,                   // the body is gzip, decoded as it is read (Go's Uncompressed)
+    data: u8[>..],
+}
+
+fn empty_response(err: i64) -> Response {
+    Response {
+        err: err, status: 0, minor: 1, reason: empty_span(), url: empty_span(), fields: empty_span(),
+        trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false, data: [],
+    }
+}
+
+fn response_part(r: const Response&, s: Span) -> const u8[:] { r.data[s.pos..s.end] }
+fn response_body(r: const Response&) -> const u8[:] { response_part(r, r.body) }
+fn response_url(r: const Response&) -> const u8[:] { response_part(r, r.url) }
+fn response_reason(r: const Response&) -> const u8[:] { response_part(r, r.reason) }
+fn response_fields(r: const Response&) -> const u8[:] { response_part(r, r.fields) }
+fn response_trailer(r: const Response&) -> const u8[:] { response_part(r, r.trailer) }
+
+// The value of the first field named `name` in a field section of
+// "Name: value\r\n" lines.
+fn field_value(fields: const u8[:], name: const u8[:]) -> const u8[:], bool {
+    var pos = 0;
+    while pos < fields.len {
+        var end = find(fields[pos..], "\r\n");
+        end = if end < 0 { fields.len } else { pos + end };
+        let line = fields[pos..end];
+        let colon = position(line, ':');
+        if colon > 0 && eq_fold(line[..colon], name) { return trim_ows(line[colon + 1..]), true; }
+        pos = end + 2;
+    }
+    return "", false;
+}
+
+fn response_header(r: const Response&, name: const u8[:]) -> const u8[:], bool {
+    return field_value(response_fields(r), name);
+}
+
+// Each value of the fields named `name`, one a line (Set-Cookie's, say),
+// as F(value).
+fn each_field<F>(fields: const u8[:], name: const u8[:]) {
+    var pos = 0;
+    while pos < fields.len {
+        var end = find(fields[pos..], "\r\n");
+        end = if end < 0 { fields.len } else { pos + end };
+        let line = fields[pos..end];
+        let colon = position(line, ':');
+        if colon > 0 && eq_fold(line[..colon], name) { F(trim_ows(line[colon + 1..])); }
+        pos = end + 2;
+    }
+}
+
+// --- Time ------------------------------------------------------------------
+
+// The time a read or write may wait (ms, 0 for ever), within the request's
+// deadline and the read timeout; -1 if the deadline has passed.
+fn wait_ms(c: const Client&, per_op: i64) -> i64 {
+    var t = per_op;
+    if c.deadline > 0 {
+        let left = (c.deadline - clock_ns()) / 1000000;
+        if left <= 0 { return -1; }
+        if t == 0 || left < t { t = left; }
+    }
+    if t > 0x7fffffff { t = 0x7fffffff; }
+    return t;
+}
+
+fn net_error(n: i64) -> i64 {
+    if n == NET_ERESOLVE { return ERR_RESOLVE; }
+    if n == NET_ECONNECT { return ERR_CONNECT; }
+    if n == NET_ETIMEOUT { return ERR_TIMEOUT; }
+    if n == NET_EARG { return ERR_URL; }
+    return ERR_IO;
+}
+
+
+// --- Connections -----------------------------------------------------------
+
+fn conn_close(c: Client&, i: i64) {
+    let pc: PoolConn& = c.conns[i];
+    if !pc.used { return; }
+    if pc.is_tls && tls::connected(pc.tc) {
+        c.wire.clear();
+        tls::close(pc.tc, c.wire);
+        link_write_wire(c, i, 1000);
+    }
+    if pc.outer >= 0 {
+        let o: OuterTls& = c.outer[pc.outer];
+        if tls::connected(o.tc) {
+            c.wire2.clear();
+            tls::close(o.tc, c.wire2);
+            httpnet_write(pc.fd, c.wire2, 1000);
+            c.wire2.clear();
+        }
+        o.used = false;
+        pc.outer = -1;
+    }
+    httpnet_close(pc.fd);
+    pc.used = false;
+    pc.idle = false;
+    pc.fd = -1;
+    if c.open == i { c.open = -1; }
+}
+
+// Closes every idle connection (Go's CloseIdleConnections).
+fn close_idle(c: Client&) {
+    for i in c.conns.len { if c.conns[i].used && c.conns[i].idle { conn_close(c, i); } }
+}
+
+fn new_slot(c: Client&) -> i64 {
+    for i in c.conns.len { if !c.conns[i].used { return i; } }
+    c.conns.push(PoolConn {
+        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, last_used: 0, server_name: [],
+        outer: -1, via_proxy: false, hc: client_conn(), tc: tls::client(c.tlscfg),
+    });
+    return c.conns.len - 1;
+}
+
+fn new_outer(c: Client&) -> i64 {
+    for k in c.outer.len { if !c.outer[k].used { c.outer[k].used = true; return k; } }
+    c.outer.push(OuterTls { used: true, server_name: [], tc: tls::client(c.tlscfg) });
+    return c.outer.len - 1;
+}
+
+// An idle connection for the key that the server has not closed, or -1.
+fn take_idle(c: Client&, key: const u8[:]) -> i64 {
+    var best = -1;
+    for i in c.conns.len {
+        let pc: PoolConn& = c.conns[i];
+        if !pc.used || !pc.idle || pc.key[..] != key { continue; }
+        // Something came while it was idle: its end, or bytes no request
+        // asked for. Either way it cannot carry a request.
+        if httpnet_readable(pc.fd) != 0 { conn_close(c, i); continue; }
+        if best < 0 || pc.last_used > c.conns[best].last_used { best = i; }
+    }
+    if best >= 0 {
+        c.conns[best].idle = false;
+        c.conns[best].reused = true;
+    }
+    return best;
+}
+
+// Back to the pool, within the idle limits (the oldest idle ones go first),
+// or closed.
+fn conn_release(c: Client&, i: i64) {
+    let pc: PoolConn& = c.conns[i];
+    if c.open == i { c.open = -1; }
+    if !pc.used { return; }
+    if !client_idle(pc.hc) || c.buf.len > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
+        conn_close(c, i);
+        return;
+    }
+    pc.idle = true;
+    pc.last_used = clock_ns();
+    // The limits: per host, then in all.
+    var rounds = 0;
+    while rounds < c.conns.len + 1 {
+        rounds++;
+        var same = 0;
+        var all = 0;
+        var oldest_same = -1;
+        var oldest = -1;
+        for j in c.conns.len {
+            let q: PoolConn& = c.conns[j];
+            if !q.used || !q.idle { continue; }
+            all++;
+            if oldest < 0 || q.last_used < c.conns[oldest].last_used { oldest = j; }
+            if q.key[..] == c.conns[i].key[..] {
+                same++;
+                if oldest_same < 0 || q.last_used < c.conns[oldest_same].last_used { oldest_same = j; }
+            }
+        }
+        if same > c.opt.max_idle_per_host { conn_close(c, oldest_same); }
+        else if all > c.opt.max_idle { conn_close(c, oldest); }
+        else { break; }
+    }
+}
+
+// --- The link beneath a connection's own TLS ----------------------------------
+
+// Sends c.wire: on the socket, or inside an https proxy's TLS.
+fn link_write_wire(c: Client&, i: i64, timeout: i64) -> i64 {
+    let pc: PoolConn& = c.conns[i];
+    var n: i64 = 0;
+    if pc.outer >= 0 {
+        c.wire2.clear();
+        if !tls::send(c.outer[pc.outer].tc, c.wire, c.wire2) { c.wire.clear(); return ERR_TLS; }
+        n = httpnet_write(pc.fd, c.wire2, timeout as! i32);
+        c.wire2.clear();
+    } else {
+        n = httpnet_write(pc.fd, c.wire, timeout as! i32);
+    }
+    c.wire.clear();
+    return if n < 0 { net_error(n) } else { ERR_NONE };
+}
+
+// Reads from the socket: what came, unwrapped from an https proxy's TLS,
+// is appended to `out`. 1 if bytes came, 0 at the end, or -ERR_*.
+fn link_read(c: Client&, i: i64, out: u8[>..]&, timeout_op: i64) -> i64 {
+    let pc: PoolConn& = c.conns[i];
+    while true {
+        let t = wait_ms(c, timeout_op);
+        if t < 0 { return -ERR_TIMEOUT; }
+        c.raw.resize(65536, 0);
+        let n = httpnet_read(pc.fd, c.raw, t as! i32);
+        if n < 0 { c.raw.clear(); return -net_error(n); }
+        c.raw.resize(n);
+        if n == 0 { return 0; }
+        if pc.outer < 0 {
+            out.append(c.raw);
+            c.raw.clear();
+            return 1;
+        }
+        let o: OuterTls& = c.outer[pc.outer];
+        let before = out.len;
+        c.wire2.clear();
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(o.server_name[..]);
+        let e = tls::client_feed(o.tc, c.tlscfg, c.raw, c.wire2, out);
+        c.raw.clear();
+        if c.wire2.len > 0 { httpnet_write(pc.fd, c.wire2, 5000); c.wire2.clear(); }
+        if e != 0 { return -ERR_TLS; }
+        if out.len > before { return 1; }
+        if tls::closed(o.tc) { return 0; }
+    }
+    return 0;
+}
+
+// Writes all of `data` (application bytes) on the connection.
+fn conn_send(c: Client&, i: i64, data: const u8[:]) -> i64 {
+    let pc: PoolConn& = c.conns[i];
+    c.wire.clear();
+    if pc.is_tls {
+        if !tls::send(pc.tc, data, c.wire) { return ERR_TLS; }
+    } else {
+        c.wire.append(data);
+    }
+    let t = wait_ms(c, c.opt.read_timeout_ms);
+    if t < 0 { c.wire.clear(); return ERR_TIMEOUT; }
+    return link_write_wire(c, i, t);
+}
+
+// Reads what comes into c.buf (decrypted): 1 if bytes came, 0 at the end
+// of the stream (TLS's close_notify included), or -ERR_*.
+fn conn_fill(c: Client&, i: i64) -> i64 {
+    let pc: PoolConn& = c.conns[i];
+    if !pc.is_tls { return link_read(c, i, c.buf, c.opt.read_timeout_ms); }
+    while true {
+        let n = link_read(c, i, c.mid, c.opt.read_timeout_ms);
+        if n <= 0 { return n; }
+        let before = c.buf.len;
+        c.wire.clear();
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(pc.server_name[..]);
+        let e = tls::client_feed(pc.tc, c.tlscfg, c.mid, c.wire, c.buf);
+        c.mid.clear();
+        if c.wire.len > 0 { link_write_wire(c, i, 5000); }
+        if e != 0 { return -ERR_TLS; }
+        if c.buf.len > before { return 1; }
+        if tls::closed(pc.tc) { return 0; }
+    }
+    return 0;
+}
+
+fn tls_setup(c: Client&, name: const u8[:]) {
+    c.tlscfg.server_name.clear();
+    c.tlscfg.server_name.append(name);
+    c.tlscfg.verify = !c.opt.insecure;
+    if c.tlscfg.alpn.len == 0 { tls::add_alpn(c.tlscfg.alpn, "http/1.1"); }
+}
+
+// The connection's own TLS handshake for `name`, over its link.
+fn conn_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
+    let pc: PoolConn& = c.conns[i];
+    pc.is_tls = true;
+    pc.server_name.clear();
+    pc.server_name.append(name);
+    tls_setup(c, name);
+    pc.tc = tls::client(c.tlscfg);
+    c.wire.clear();
+    tls::client_start(pc.tc, c.tlscfg, c.wire);
+    while !tls::connected(pc.tc) {
+        let t = wait_ms(c, c.opt.connect_timeout_ms);
+        if t < 0 { return ERR_TIMEOUT; }
+        if c.wire.len > 0 {
+            let we = link_write_wire(c, i, t);
+            if we != ERR_NONE { return we; }
+        }
+        let n = link_read(c, i, c.mid, c.opt.connect_timeout_ms);
+        if n <= 0 { c.mid.clear(); return if n == 0 { ERR_TLS } else { -n }; }
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(name);
+        let e = tls::client_feed(pc.tc, c.tlscfg, c.mid, c.wire, c.buf);
+        c.mid.clear();
+        if e != 0 {
+            if c.wire.len > 0 { link_write_wire(c, i, 1000); }
+            return ERR_TLS;
+        }
+    }
+    if c.wire.len > 0 {
+        let t = wait_ms(c, c.opt.connect_timeout_ms);
+        return link_write_wire(c, i, if t < 0 { 1 } else { t });
+    }
+    return ERR_NONE;
+}
+
+// TLS to an https proxy, on the socket, beneath what the connection sends.
+fn outer_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
+    let k = new_outer(c);
+    let o: OuterTls& = c.outer[k];
+    o.server_name.clear();
+    o.server_name.append(name);
+    tls_setup(c, name);
+    o.tc = tls::client(c.tlscfg);
+    let fd = c.conns[i].fd;
+    c.conns[i].outer = k;
+    c.wire2.clear();
+    tls::client_start(o.tc, c.tlscfg, c.wire2);
+    while !tls::connected(o.tc) {
+        let t = wait_ms(c, c.opt.connect_timeout_ms);
+        if t < 0 { return ERR_TIMEOUT; }
+        if c.wire2.len > 0 {
+            if httpnet_write(fd, c.wire2, t as! i32) < 0 { c.wire2.clear(); return ERR_IO; }
+            c.wire2.clear();
+        }
+        c.raw.resize(65536, 0);
+        let n = httpnet_read(fd, c.raw, t as! i32);
+        if n <= 0 { c.raw.clear(); return if n == NET_ETIMEOUT { ERR_TIMEOUT } else if n == 0 { ERR_TLS } else { ERR_IO }; }
+        c.raw.resize(n);
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(name);
+        let e = tls::client_feed(o.tc, c.tlscfg, c.raw, c.wire2, c.mid);
+        c.raw.clear();
+        if e != 0 {
+            if c.wire2.len > 0 { httpnet_write(fd, c.wire2, 1000); }
+            c.wire2.clear();
+            return ERR_TLS;
+        }
+    }
+    if c.wire2.len > 0 {
+        let t = wait_ms(c, c.opt.connect_timeout_ms);
+        if httpnet_write(fd, c.wire2, if t < 0 { 1 } else { t as! i32 }) < 0 { c.wire2.clear(); return ERR_IO; }
+        c.wire2.clear();
+    }
+    return ERR_NONE;
+}
+
+// A TCP connection to host:port in slot i.
+fn conn_dial(c: Client&, i: i64, host: const u8[:], port: i64) -> i64 {
+    var t = wait_ms(c, c.opt.connect_timeout_ms);
+    if t < 0 { return ERR_TIMEOUT; }
+    let fd = httpnet_connect(host, port as! i32, t as! i32);
+    if fd < 0 { return net_error(fd); }
+    let pc: PoolConn& = c.conns[i];
+    pc.used = true;
+    pc.idle = false;
+    pc.fd = fd;
+    pc.is_tls = false;
+    pc.reused = false;
+    pc.outer = -1;
+    pc.via_proxy = false;
+    pc.hc = client_conn();
+    return ERR_NONE;
+}
+
+// --- Proxies ---------------------------------------------------------------
+
+// Go's useProxy: whether NO_PROXY (and, for proxies from the environment,
+// the rule that localhost and loopback addresses go direct) let `host`
+// (ASCII, lowered, no brackets) on `port` go through the proxy.
+fn use_proxy(c: const Client&, host: const u8[:], port: i64, loopback_rule: bool) -> bool {
+    let ip, kind = parse_ip(host);
+    if loopback_rule {
+        if host == "localhost" { return false; }
+        if kind != 0 && ip_is_loopback(ip, kind) { return false; }
+    }
+    var port_text: u8[>..] = [];
+    format(port_text, port);
+    var use = true;
+    each_split(c.no_proxy, ',') {
+        var p: u8[>..] = [];
+        for ch in trim_ows(it) { p.push(lower(ch)); }
+        if use && p.len > 0 {
+            if p[..] == "*" { use = false; }
+            // "host:port", "[v6]:port", or a host; a CIDR block "ip/bits".
+            var phost = p[..];
+            var pport: u8[>..] = [];
+            let slash = position(p, '/');
+            if slash > 0 {
+                if kind != 0 && cidr_contains(p, ip, kind) { use = false; }
+            } else {
+                if phost.len > 0 && phost[0] == '[' {
+                    let close = position(phost, ']');
+                    if close > 0 {
+                        if close + 1 < phost.len && phost[close + 1] == ':' { pport.append(phost[close + 2..]); }
+                        phost = phost[1..close];
+                    }
+                } else {
+                    let colon = last_index(phost, ':');
+                    if colon > 0 && position(phost[..colon], ':') < 0 { pport.append(phost[colon + 1..]); phost = phost[..colon]; }
+                }
+                let pip, pkind = parse_ip(phost);
+                if pkind != 0 {
+                    if kind != 0 && ip_equal(ip, pip) && (pport.len == 0 || pport[..] == port_text[..]) { use = false; }
+                } else if phost.len > 0 && kind == 0 {
+                    // "*.example.com" and ".example.com" match subdomains;
+                    // "example.com" matches it and its subdomains.
+                    var dom = phost;
+                    if starts_with(dom, "*.") { dom = dom[1..]; }
+                    let match_host = dom[0] != '.';
+                    var suffix: u8[>..] = [];
+                    if match_host { suffix.push('.'); }
+                    suffix.append(dom);
+                    let hit = ends_with(host, suffix[..]) || (match_host && host == suffix[1..]);
+                    if hit && (pport.len == 0 || pport[..] == port_text[..]) { use = false; }
+                }
+            }
+        }
+    };
+    return use;
+}
+
+fn ip_equal(a: const u8[:], b: const u8[:]) -> bool { a == b }
+
+// Whether "ip/bits" holds the address.
+fn cidr_contains(p: const u8[:], ip: const u8[:], kind: i64) -> bool {
+    let slash = position(p, '/');
+    let net, nkind = parse_ip(p[..slash]);
+    let bits, ok = parse_int(p[slash + 1..]);
+    if nkind == 0 || !ok || bits < 0 { return false; }
+    // An IPv4 block's bits count from the IPv4 part of the 16 bytes.
+    let total = if nkind == 4 { bits + 96 } else { bits };
+    if (nkind == 4 && bits > 32) || total > 128 { return false; }
+    if (nkind == 4) != (kind == 4) { return false; }
+    for b in 128 {
+        if b >= total { break; }
+        let m = (0x80 >> (b % 8)) as! u8;
+        if (ip[b / 8] & m) != (net[b / 8] & m) { return false; }
+    }
+    return true;
+}
+
+// The proxy for a URL, as Go's Proxy funcs choose it: its URL text, or
+// empty for none. Go's parseProxy: a value without a scheme is "http://"
+// and the value.
+fn proxy_for(c: const Client&, u: const Url&) -> u8[>..] {
+    var out: u8[>..] = [];
+    if c.proxy_mode == PROXY_NONE { return out; }
+    let https = url_https(u);
+    let p = if https { c.proxy_https[..] } else { c.proxy_http[..] };
+    if p.len == 0 { return out; }
+    if c.proxy_mode == PROXY_ENV {
+        if !https && c.proxy_cgi { return out; }
+        let h, ok = cookie_host(u);
+        if !ok || !use_proxy(c, h, url_port(u), true) { return out; }
+    } else if c.no_proxy.len > 0 {
+        // One proxy for all, but for the hosts no_proxy names (curl's --noproxy).
+        let h, ok = cookie_host(u);
+        if !ok || !use_proxy(c, h, url_port(u), false) { return out; }
+    }
+    let pu, e = url_parse(p);
+    if e != URL_OK || span_len(pu.scheme) == 0 || span_len(pu.host) == 0 { out.append("http://"); }
+    out.append(p);
+    return out;
+}
+
+// RFC 1928's CONNECT through a SOCKS5 proxy already connected in slot i,
+// with RFC 1929's user name and password from the proxy URL if it has them.
+fn socks5_connect(c: Client&, i: i64, pu: const Url&, host: const u8[:], port: i64) -> i64 {
+    let user = url_username(pu);
+    let pass = url_password(pu);
+    let auth = pu.has_user;
+    c.wire.clear();
+    if auth { c.wire.append([5, 2, 0, 2]); } else { c.wire.append([5, 1, 0]); }
+    var e = link_write_wire(c, i, wait_ms(c, c.opt.connect_timeout_ms));
+    if e != ERR_NONE { return e; }
+    var got: u8[>..] = [];
+    e = read_at_least(c, i, got, 2);
+    if e != ERR_NONE { return e; }
+    if got[0] != 5 { return ERR_PROXY; }
+    if got[1] == 2 && auth {
+        if user.len > 255 || pass.len > 255 { return ERR_PROXY; }
+        c.wire.push(1);
+        c.wire.push(user.len as! u8);
+        c.wire.append(user);
+        c.wire.push(pass.len as! u8);
+        c.wire.append(pass);
+        e = link_write_wire(c, i, wait_ms(c, c.opt.connect_timeout_ms));
+        if e != ERR_NONE { return e; }
+        got.clear();
+        e = read_at_least(c, i, got, 2);
+        if e != ERR_NONE { return e; }
+        if got[1] != 0 { return ERR_PROXY; }
+    } else if got[1] != 0 {
+        return ERR_PROXY;
+    }
+    got.clear();
+    // The target by name (the proxy resolves it), or as an address.
+    c.wire.append([5, 1, 0]);
+    let ip, kind = parse_ip(host);
+    if kind == 4 { c.wire.push(1); c.wire.append(ip[12..16]); }
+    else if kind == 6 { c.wire.push(4); c.wire.append(ip[..]); }
+    else {
+        if host.len > 255 { return ERR_PROXY; }
+        c.wire.push(3);
+        c.wire.push(host.len as! u8);
+        c.wire.append(host);
+    }
+    c.wire.push((port >> 8) as! u8);
+    c.wire.push((port & 0xff) as! u8);
+    e = link_write_wire(c, i, wait_ms(c, c.opt.connect_timeout_ms));
+    if e != ERR_NONE { return e; }
+    e = read_at_least(c, i, got, 5);
+    if e != ERR_NONE { return e; }
+    if got[0] != 5 || got[1] != 0 { return ERR_PROXY; }
+    // VER REP RSV ATYP BND.ADDR BND.PORT
+    let alen: i64 = if got[3] == 1 { 4 } else if got[3] == 4 { 16 } else if got[3] == 3 { 1 + got[4] } else { -1 };
+    if alen < 0 { return ERR_PROXY; }
+    e = read_at_least(c, i, got, 4 + alen + 2);
+    if e != ERR_NONE { return e; }
+    if got.len != 4 + alen + 2 { return ERR_PROXY; }
+    return ERR_NONE;
+}
+
+fn read_at_least(c: Client&, i: i64, got: u8[>..]&, n: i64) -> i64 {
+    while got.len < n {
+        let r = link_read(c, i, got, c.opt.connect_timeout_ms);
+        if r == 0 { return ERR_PROXY; }
+        if r < 0 { return -r; }
+    }
+    return ERR_NONE;
+}
+
+// A CONNECT tunnel to host:port through the HTTP proxy in slot i (RFC 9110
+// §9.3.6). A refusal leaves its status and fields in c.proxy_status and
+// c.proxy_fields (a 407's Proxy-Authenticate, say).
+fn http_connect(c: Client&, i: i64, authority: const u8[:]) -> i64 {
+    var req: u8[>..] = [];
+    req.append("CONNECT ");
+    req.append(authority);
+    req.append(" HTTP/1.1\r\nHost: ");
+    req.append(authority);
+    req.append("\r\n");
+    if c.proxy_authz.len > 0 { req.append("Proxy-Authorization: "); req.append(c.proxy_authz); req.append("\r\n"); }
+    if c.opt.user_agent.len > 0 { req.append("User-Agent: "); req.append(c.opt.user_agent[..]); req.append("\r\n"); }
+    req.append("\r\n");
+    c.wire.clear();
+    c.wire.append(req);
+    var e = link_write_wire(c, i, wait_ms(c, c.opt.connect_timeout_ms));
+    if e != ERR_NONE { return e; }
+    var got: u8[>..] = [];
+    let lim = default_limits();
+    while true {
+        let h, n = parse_response(got, lim);
+        if n > 0 {
+            if h.status >= 200 && h.status < 300 {
+                // Nothing may come before the tunnel's first bytes are sent.
+                if got.len > n { return ERR_PROXY; }
+                return ERR_NONE;
+            }
+            if h.status < 200 { var rest: u8[>..] = []; rest.append(got[n..]); got.clear(); got.append(rest); continue; }
+            c.proxy_status = h.status;
+            c.proxy_fields.clear();
+            for f in h.fields {
+                c.proxy_fields.append(got[f.name.pos..f.name.end]);
+                c.proxy_fields.append(": ");
+                c.proxy_fields.append(got[f.value.pos..f.value.end]);
+                c.proxy_fields.append("\r\n");
+            }
+            return ERR_PROXY;
+        }
+        if n < 0 { return ERR_PROXY; }
+        let r = link_read(c, i, got, c.opt.connect_timeout_ms);
+        if r == 0 { return ERR_PROXY; }
+        if r < 0 { return -r; }
+    }
+    return ERR_PROXY;
+}
+
+// The pool's key for a URL reached directly: scheme, ASCII host, port.
+fn origin_key(u: const Url&, out: u8[>..]&) -> bool {
+    out.append(url_scheme(u));
+    out.append("://");
+    let h, ok = url_ascii_host(u);
+    if !ok { return false; }
+    out.append(h);
+    out.push(':');
+    format(out, url_port(u));
+    return true;
+}
+
+// A connection for the URL: an idle one from the pool, else a new one,
+// through the proxy proxy_for gives. The slot, or -ERR_*.
+fn conn_for(c: Client&, u: const Url&, fresh: bool) -> i64 {
+    let ptext = proxy_for(c, u);
+    var pu = empty_url();
+    var key: u8[>..] = [];
+    var pscheme: u8[>..] = [];
+    if ptext.len > 0 {
+        let p, pe = url_parse(ptext);
+        if pe != URL_OK { return -ERR_PROXY; }
+        pu = copy(p);
+        pscheme.append(url_scheme(pu));
+        if pscheme[..] != "http" && pscheme[..] != "https" && pscheme[..] != "socks5" && pscheme[..] != "socks5h" {
+            return -ERR_PROXY;
+        }
+        key.append(url_redacted(pu));
+        key.push('|');
+    }
+    let direct_http = ptext.len > 0 && (pscheme[..] == "http" || pscheme[..] == "https") && !url_https(u);
+    // Through an HTTP proxy, every http URL shares the proxy's connections
+    // (Go's connectMethodKey without a target).
+    if direct_http { key.append("http"); }
+    else if !origin_key(u, key) { return -ERR_URL; }
+    if key.len > 600 { return -ERR_URL; }
+    if !fresh {
+        let i = take_idle(c, key);
+        if i >= 0 { return i; }
+    }
+    let host, ok = url_ascii_host(u);
+    let port = url_port(u);
+    if !ok || port < 0 { return -ERR_URL; }
+    let i = new_slot(c);
+    c.proxy_status = 0;
+    if ptext.len == 0 {
+        let e = conn_dial(c, i, host, port);
+        if e != ERR_NONE { return -e; }
+    } else {
+        let phost, pok = url_ascii_host(pu);
+        let pport = url_port(pu);
+        if !pok || pport < 0 { return -ERR_PROXY; }
+        let e = conn_dial(c, i, phost, pport);
+        if e != ERR_NONE { return -(if e == ERR_TIMEOUT { e } else { ERR_PROXY }); }
+        var pe = ERR_NONE;
+        if pscheme[..] == "socks5" || pscheme[..] == "socks5h" {
+            pe = socks5_connect(c, i, pu, host, port);
+        } else {
+            if pscheme[..] == "https" { pe = outer_handshake(c, i, phost); }
+            if pe == ERR_NONE {
+                if url_https(u) {
+                    var auth: u8[>..] = [];
+                    host_port_text(u, auth);
+                    pe = http_connect(c, i, auth);
+                } else {
+                    c.conns[i].via_proxy = true;
+                }
+            }
+        }
+        if pe != ERR_NONE { conn_close(c, i); return -pe; }
+    }
+    c.conns[i].key.clear();
+    c.conns[i].key.append(key);
+    if url_https(u) {
+        let he = conn_handshake(c, i, host);
+        if he != ERR_NONE { conn_close(c, i); return -he; }
+    }
+    return i;
+}
+
+// "host:port" for CONNECT: the port always there (RFC 9112 §3.2.3).
+fn host_port_text(u: const Url&, out: u8[>..]&) {
+    let h, ok = url_ascii_host(u);
+    if u.ipv6 { out.push('['); }
+    out.append(h);
+    if u.ipv6 { out.push(']'); }
+    out.push(':');
+    format(out, url_port(u));
+}
+
+// --- Requests --------------------------------------------------------------
+
+// Go's isReplayable: a request it is safe to send again after the
+// connection failed under it.
+fn replayable(method: const u8[:], fields: const u8[:]) -> bool {
+    if method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE" { return true; }
+    let a, ka = field_value(fields, "Idempotency-Key");
+    let b, kb = field_value(fields, "X-Idempotency-Key");
+    return ka || kb;
+}
+
+// Removes the field lines named `name`.
+fn remove_field(fields: u8[>..]&, name: const u8[:]) {
+    let kept = fields_without(fields, name);
+    fields.clear();
+    fields.append(kept);
+}
+
+// The field lines without those named `name`.
+fn fields_without(fields: const u8[:], name: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    var pos = 0;
+    while pos < fields.len {
+        var end = find(fields[pos..], "\r\n");
+        end = if end < 0 { fields.len } else { pos + end };
+        let line = fields[pos..end];
+        let colon = position(line, ':');
+        if !(colon > 0 && eq_fold(line[..colon], name)) && line.len > 0 {
+            out.append(line);
+            out.append("\r\n");
+        }
+        pos = end + 2;
+    }
+    return out;
+}
+
+// Sends one request and reads its response's head: a Response whose body
+// is to be read with read_body (or read_all), the connection checked out
+// of the pool until it ends. `fields` from add_field, without
+// Content-Length or Transfer-Encoding; a Host field in them is the Host
+// sent (Go's Request.Host), else the URL's. `body` goes with a
+// Content-Length, or in chunks if the fields have "Transfer-Encoding:
+// chunked". Through an HTTP proxy the target is absolute-form and
+// c.proxy_authz is sent as Proxy-Authorization.
+//
+// A request on a reused connection that fails before any of the response
+// came is sent again on a new one if it is replayable (Go's
+// shouldRetryRequest).
+fn round_trip(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:], body: const u8[:]) -> Response {
+    if c.open >= 0 { return empty_response(ERR_STATE); }
+    if url_check_http(u) != URL_OK { return empty_response(ERR_URL); }
+    var host: u8[>..] = [];
+    let given, has_host = field_value(fields, "Host");
+    if has_host { host.append(given); } else if !host_port_field(u, host) { return empty_response(ERR_URL); }
+    var rest = fields_without(fields, "Host");
+    // "Transfer-Encoding: chunked" among the fields: the body goes in chunks.
+    let te, has_te = field_value(fields, "Transfer-Encoding");
+    if has_te && !eq_fold(te, "chunked") { return empty_response(ERR_REQUEST); }
+    let chunked = has_te;
+    remove_field(rest, "Transfer-Encoding");
+    var attempt = 0;
+    while true {
+        attempt++;
+        let i = conn_for(c, u, attempt > 1);
+        if i < 0 { return empty_response(-i); }
+        let reused = c.conns[i].reused;
+        c.buf.clear();
+        c.mid.clear();
+        var target: u8[>..] = [];
+        var f: u8[>..] = [];
+        f.append(rest);
+        if c.conns[i].via_proxy {
+            absolute_target(u, target);
+            if c.proxy_authz.len > 0 { add_field(f, "Proxy-Authorization", c.proxy_authz); }
+        } else {
+            request_target(u, target);
+        }
+        var msg: u8[>..] = [];
+        var length: i64 = if body.len > 0 || method == "POST" || method == "PUT" || method == "PATCH" { body.len } else { 0 };
+        if chunked { length = -1; }
+        if !client_request(c.conns[i].hc, method, target, host, f, length, msg) {
+            conn_release(c, i);
+            return empty_response(ERR_REQUEST);
+        }
+        if chunked {
+            if body.len > 0 { write_chunk(msg, body); }
+            write_last_chunk(msg, "");
+        } else {
+            msg.append(body);
+        }
+        let se = conn_send(c, i, msg);
+        if se != ERR_NONE {
+            conn_close(c, i);
+            if reused && attempt == 1 && se == ERR_IO && replayable(method, fields) { continue; }
+            return empty_response(se);
+        }
+        c.open = i;
+        var r = read_head(c, i, u);
+        if r.err == ERR_NONE { return r; }
+        // Nothing of a response came on a reused connection.
+        let retry = reused && attempt == 1 && r.status == -1 && replayable(method, fields);
+        conn_close(c, i);
+        if retry { continue; }
+        r.status = 0;
+        return r;
+    }
+    return empty_response(ERR_IO);
+}
+
+// The response head (1xx ones skipped). On an error, status -1 says
+// nothing at all came (the request may be retried).
+fn read_head(c: Client&, i: i64, u: const Url&) -> Response {
+    var r = empty_response(ERR_NONE);
+    r.data.append(url_text(u));
+    r.url = span(0, r.data.len);
+    var got_any = false;
+    var eof = false;
+    var trailer: u8[>..] = [];
+    var body: u8[>..] = [];
+    while true {
+        let pc: PoolConn& = c.conns[i];
+        let ev, h = client_read(pc.hc, c.buf, body, trailer);
+        if ev.kind == EV_RESPONSE {
+            got_any = true;
+            if h.status >= 100 && h.status < 200 && h.status != 101 {
+                drop_front(c.buf, ev.used);
+                continue;
+            }
+            r.status = h.status;
+            r.minor = h.minor;
+            let rp = r.data.len;
+            r.data.append(c.buf[h.reason.pos..h.reason.end]);
+            r.reason = span(rp, r.data.len);
+            let fp = r.data.len;
+            for f in h.fields {
+                r.data.append(c.buf[f.name.pos..f.name.end]);
+                r.data.append(": ");
+                r.data.append(c.buf[f.value.pos..f.value.end]);
+                r.data.append("\r\n");
+            }
+            r.fields = span(fp, r.data.len);
+            r.body = span(r.data.len, r.data.len);
+            r.trailer = r.body;
+            drop_front(c.buf, ev.used);
+            r.conn = i;
+            r.body_done = client_idle(pc.hc) || client_closed(pc.hc);
+            if h.status == 101 { r.err = ERR_PROTOCOL; r.status = 0; conn_close(c, i); r.conn = -1; return r; }
+            if r.body_done { finish_body(c, r); }
+            return r;
+        }
+        if ev.kind == EV_ERROR { r.err = ERR_PROTOCOL; return r; }
+        if ev.kind != EV_NEED_MORE { r.err = ERR_PROTOCOL; return r; }
+        if eof {
+            r.err = ERR_IO;
+            if !got_any && c.buf.len == 0 { r.status = -1; }
+            return r;
+        }
+        let n = conn_fill(c, i);
+        if n < 0 {
+            r.err = -n;
+            if !got_any && c.buf.len == 0 && -n == ERR_IO { r.status = -1; }
+            return r;
+        }
+        if n == 0 { eof = true; }
+    }
+    return r;
+}
+
+fn drop_front(b: u8[>..]&, n: i64) {
+    if n <= 0 { return; }
+    if n >= b.len { b.clear(); return; }
+    let rest = b.len - n;
+    for k in rest { b[k] = b[n + k]; }
+    b.resize(rest);
+}
+
+// The body is all read: the connection goes back to the pool or closes.
+fn finish_body(c: Client&, r: Response&) {
+    if r.conn >= 0 {
+        let i = r.conn;
+        r.conn = -1;
+        if client_closed(c.conns[i].hc) { conn_close(c, i); } else { conn_release(c, i); }
+    }
+    r.body_done = true;
+}
+
+// Reads more of the body as it came on the wire (gzip or not).
+fn read_wire_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
+    if r.body_done || r.conn < 0 { return 0; }
+    let i = r.conn;
+    var trailer: u8[>..] = [];
+    var eof = false;
+    while true {
+        let before = out.len;
+        let ev, h = client_read(c.conns[i].hc, c.buf, out, trailer);
+        drop_front(c.buf, ev.used);
+        if ev.kind == EV_END {
+            if trailer.len > 0 {
+                let tp = r.data.len;
+                append_trailer(r.data, trailer);
+                r.trailer = span(tp, r.data.len);
+            }
+            finish_body(c, r);
+            return out.len - before;
+        }
+        // A chunk-size line alone appends nothing: read on, so 0 means the end.
+        if ev.kind == EV_BODY {
+            if out.len > before { return out.len - before; }
+            continue;
+        }
+        if ev.kind != EV_NEED_MORE { conn_close(c, i); r.conn = -1; r.body_done = true; return -ERR_PROTOCOL; }
+        if eof {
+            let e = client_eof(c.conns[i].hc);
+            conn_close(c, i);
+            r.conn = -1;
+            r.body_done = true;
+            return if e.kind == EV_END { 0 } else { -ERR_IO };
+        }
+        let n = conn_fill(c, i);
+        if n < 0 { conn_close(c, i); r.conn = -1; r.body_done = true; return n; }
+        if n == 0 { eof = true; }
+    }
+    return 0;
+}
+
+// Reads more of the body, decoded if it is gzip that the client asked
+// for, appending it to `out`: how many bytes (0 at the end, when the
+// connection has gone back to the pool), or -ERR_* (the connection is
+// closed then). The trailer, after a chunked body, goes to the response's
+// data.
+fn read_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
+    if !r.decode { return read_wire_body(c, r, out); }
+    var wire: u8[>..] = [];
+    while true {
+        if r.body_done {
+            if !inflate_done(c.inflate) { return -ERR_DECODE; }
+            return 0;
+        }
+        wire.clear();
+        let n = read_wire_body(c, r, wire);
+        if n < 0 { return n; }
+        let before = out.len;
+        if inflate_feed(c.inflate, wire, out) != 0 {
+            if r.conn >= 0 { conn_close(c, r.conn); r.conn = -1; }
+            r.body_done = true;
+            return -ERR_DECODE;
+        }
+        if out.len > before { return out.len - before; }
+        if r.body_done && !inflate_done(c.inflate) { return -ERR_DECODE; }
+        if r.body_done { return 0; }
+    }
+    return 0;
+}
+
+// The trailer as chunked_feed leaves it ("Name: value" lines with CRLF), as
+// field lines.
+fn append_trailer(data: u8[>..]&, trailer: const u8[:]) {
+    var pos = 0;
+    while pos < trailer.len {
+        var end = find(trailer[pos..], "\r\n");
+        end = if end < 0 { trailer.len } else { pos + end };
+        let line = trailer[pos..end];
+        let colon = position(line, ':');
+        if colon > 0 {
+            data.append(line[..colon]);
+            data.append(": ");
+            data.append(trim_ows(line[colon + 1..]));
+            data.append("\r\n");
+        }
+        pos = end + 2;
+    }
+}
+
+// Stops reading the body: the connection closes, unless the rest of a
+// small body is already here or comes at once (Go reads up to 2 KB of it
+// to keep the connection).
+fn close_body(c: Client&, r: Response&) {
+    if r.body_done || r.conn < 0 { r.body_done = true; return; }
+    var sink: u8[>..] = [];
+    var rounds = 0;
+    while !r.body_done && sink.len <= 2048 && rounds < 4 {
+        rounds++;
+        let n = read_wire_body(c, r, sink);
+        if n < 0 { return; }
+    }
+    if !r.body_done {
+        conn_close(c, r.conn);
+        r.conn = -1;
+        r.body_done = true;
+    }
+}
+
+// Reads the rest of the body into the response (r.body), up to the
+// client's max_body.
+fn read_all(c: Client&, r: Response&) -> i64 {
+    var body: u8[>..] = [];
+    while !r.body_done {
+        let n = read_body(c, r, body);
+        if n < 0 { r.err = -n; return -n; }
+        if body.len > c.opt.max_body { close_body(c, r); r.err = ERR_TOO_LARGE; return ERR_TOO_LARGE; }
+    }
+    if r.decode && !inflate_done(c.inflate) { r.err = ERR_DECODE; return ERR_DECODE; }
+    // The body goes before the trailer, which read_body put at the end.
+    var t: u8[>..] = [];
+    let had_trailer = span_len(r.trailer) > 0;
+    if had_trailer {
+        t.append(response_trailer(r));
+        r.data.resize(r.trailer.pos);
+    }
+    let bp = r.data.len;
+    r.data.append(body);
+    r.body = span(bp, r.data.len);
+    let tp = r.data.len;
+    r.data.append(t);
+    r.trailer = span(tp, r.data.len);
+    return ERR_NONE;
+}

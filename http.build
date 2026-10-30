@@ -1,0 +1,4 @@
+// http's sidecar: the sockets of http.client (src/httpnet.c). A program
+// compiles them only when it uses that module; the parsers need no C.
+c_sources = ["src/httpnet.c"];
+c_libs_windows = ["ws2_32"];

@@ -12,6 +12,8 @@ writes byte strings, and the caller owns the sockets.
 | `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt |
 | `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
 | `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
+| `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose, timeouts, retrying a replayable request on a connection the server had closed, bodies read whole or as a stream; HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
+| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401, Digest, Bearer, a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch` |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
@@ -95,13 +97,17 @@ or HTTPS through tlsgoose (`--tls-max 1.2` holds it to TLS 1.2), on
 127.0.0.1 unless told otherwise, one process a connection; GET and HEAD,
 and POST /echo. Paths are percent-decoded once, refuse `..` segments and
 NUL, and must resolve, symbolic links followed, inside the root.
-`tools/http.goose` (goose-http) is a client of http and https URLs,
-keeping a connection for URLs of one origin, checking certificates
-against `--cacert` or the system's roots.
+`tools/http.goose` (goose-http) is a client on `http.fetch` with curl's
+options: `-L`, `--max-redirs`, `-u` with `--basic`/`--digest`/`--anyauth`,
+`--oauth2-bearer`, `-x` (http, https, socks5, socks5h) and `--noproxy`
+(else the proxy environment variables, as curl reads them), `-b`/`-c`
+cookie files, `--compressed`, `-I`, `-i`, `-o`, `-A`, `-e`, `--cacert`,
+`-k`, `--tls-max`, `--connect-timeout`, `-m`. It keeps a connection for
+URLs of one origin.
 
 ```bash
 goose build tools/httpd.goose && tools/goose-httpd --root site --port 8080 [--cert c.pem --key k.pem --tls-max 1.2]
-goose build tools/http.goose && tools/goose-http [-X M] [-d DATA] [-H 'N: v'] [-i] [--chunked] [--cacert c.pem] URL...
+goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v'] [-i] [-u U:P] [-x PROXY] [-b F -c F] [--compressed] URL...
 ```
 
 ## Tests
