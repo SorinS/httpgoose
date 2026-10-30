@@ -8,6 +8,7 @@ writes byte strings, and the caller owns the sockets.
 |---|---|
 | `http` | RFC 9110's syntax: tokens, field names and values, fields of a parsed message, status codes, building field sections |
 | `http.h1` | RFC 9112: request and response heads, body framing (§6.3), the chunked coding (§7.1), writing messages |
+| `http.url` | RFC 3986 URLs as Go's net/url reads them: parsing, resolving references (§5.2), percent-encoding, queries and forms, IP addresses, Punycode host names |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
@@ -105,7 +106,16 @@ goose build tools/http.goose && tools/goose-http [-X M] [-d DATA] [-H 'N: v'] [-
 ```bash
 python3 scripts/run_tests.py [--native]        # test/*.goose at -O0, -O2, --debug (and natively)
 python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
+python3 scripts/url_differential.py [--seed N] [--random N] [-v]
 ```
+
+`url_differential.py` parses every string literal of Go's net/url tests,
+RFC 3986 §5.4's examples and generated URLs with `http.url` and with Go's
+url.Parse, resolves them against bases, and compares every part. They
+agree except where Go departs from RFC 3986 §5.2.2, counted apart: a
+reference with an empty authority (`//?q`), which Go cannot tell from none
+and so keeps the base's host, and a base with an empty query (`x?`), whose
+`?` Go drops.
 
 `interop.py` runs goose-httpd against curl (OpenSSL's, for TLS 1.3),
 Go's net/http client and Python's http.client, and goose-http against
