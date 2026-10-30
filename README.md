@@ -9,6 +9,9 @@ writes byte strings, and the caller owns the sockets.
 | `http` | RFC 9110's syntax: tokens, field names and values, fields of a parsed message, status codes, building field sections |
 | `http.h1` | RFC 9112: request and response heads, body framing (§6.3), the chunked coding (§7.1), writing messages |
 | `http.url` | RFC 3986 URLs as Go's net/url reads them: parsing, resolving references (§5.2), percent-encoding, queries and forms, IP addresses, Punycode host names |
+| `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt |
+| `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
+| `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
