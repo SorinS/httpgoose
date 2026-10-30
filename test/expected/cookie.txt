@@ -1,0 +1,4 @@
+jar tests: 77
+unit vectors: 159
+public suffix list rules: over 9000; test_psl.txt checks: 77
+cookie: all passed

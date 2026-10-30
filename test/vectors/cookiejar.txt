@@ -1,0 +1,701 @@
+# Go's net/http/cookiejar jar_test.go tables (go version go1.27.1 darwin/arm64), from scripts/gen_cookie_vectors.py
+group	basicsTests	fresh
+test	Retrieval of a plain host cookie.
+from	http://www.host.test/
+set	A=a
+content	A=a
+query	http://www.host.test	A=a
+query	http://www.host.test/	A=a
+query	http://www.host.test/some/path	A=a
+query	https://www.host.test	A=a
+query	https://www.host.test/	A=a
+query	https://www.host.test/some/path	A=a
+query	ftp://www.host.test	
+query	ftp://www.host.test/	
+query	ftp://www.host.test/some/path	
+query	http://www.other.org	
+query	http://sibling.host.test	
+query	http://deep.www.host.test	
+end
+test	Secure cookies are not returned to http.
+from	http://www.host.test/
+set	A=a; secure
+content	A=a
+query	http://www.host.test	
+query	http://www.host.test/	
+query	http://www.host.test/some/path	
+query	https://www.host.test	A=a
+query	https://www.host.test/	A=a
+query	https://www.host.test/some/path	A=a
+end
+test	Secure cookies are sent for localhost
+from	http://localhost:8910/
+set	A=a; secure
+content	A=a
+query	http://localhost:8910	A=a
+query	http://localhost:8910/	A=a
+query	http://localhost:8910/some/path	A=a
+query	https://localhost:8910	A=a
+query	https://localhost:8910/	A=a
+query	https://localhost:8910/some/path	A=a
+end
+test	Secure cookies are sent for localhost (tld)
+from	http://example.LOCALHOST:8910/
+set	A=a; secure
+content	A=a
+query	http://example.LOCALHOST:8910	A=a
+query	http://example.LOCALHOST:8910/	A=a
+query	http://example.LOCALHOST:8910/some/path	A=a
+query	https://example.LOCALHOST:8910	A=a
+query	https://example.LOCALHOST:8910/	A=a
+query	https://example.LOCALHOST:8910/some/path	A=a
+end
+test	Secure cookies are sent for localhost (ipv6)
+from	http://[::1]:8910/
+set	A=a; secure
+content	A=a
+query	http://[::1]:8910	A=a
+query	http://[::1]:8910/	A=a
+query	http://[::1]:8910/some/path	A=a
+query	https://[::1]:8910	A=a
+query	https://[::1]:8910/	A=a
+query	https://[::1]:8910/some/path	A=a
+end
+test	Localhost only if it's a segment
+from	http://notlocalhost/
+set	A=a; secure
+content	A=a
+query	http://notlocalhost	
+query	http://notlocalhost/	
+query	http://notlocalhost/some/path	
+query	https://notlocalhost	A=a
+query	https://notlocalhost/	A=a
+query	https://notlocalhost/some/path	A=a
+end
+test	Explicit path.
+from	http://www.host.test/
+set	A=a; path=/some/path
+content	A=a
+query	http://www.host.test	
+query	http://www.host.test/	
+query	http://www.host.test/some	
+query	http://www.host.test/some/	
+query	http://www.host.test/some/path	A=a
+query	http://www.host.test/some/paths	
+query	http://www.host.test/some/path/foo	A=a
+query	http://www.host.test/some/path/foo/	A=a
+end
+test	Implicit path #1: path is a directory.
+from	http://www.host.test/some/path/
+set	A=a
+content	A=a
+query	http://www.host.test	
+query	http://www.host.test/	
+query	http://www.host.test/some	
+query	http://www.host.test/some/	
+query	http://www.host.test/some/path	A=a
+query	http://www.host.test/some/paths	
+query	http://www.host.test/some/path/foo	A=a
+query	http://www.host.test/some/path/foo/	A=a
+end
+test	Implicit path #2: path is not a directory.
+from	http://www.host.test/some/path/index.html
+set	A=a
+content	A=a
+query	http://www.host.test	
+query	http://www.host.test/	
+query	http://www.host.test/some	
+query	http://www.host.test/some/	
+query	http://www.host.test/some/path	A=a
+query	http://www.host.test/some/paths	
+query	http://www.host.test/some/path/foo	A=a
+query	http://www.host.test/some/path/foo/	A=a
+end
+test	Implicit path #3: no path in URL at all.
+from	http://www.host.test
+set	A=a
+content	A=a
+query	http://www.host.test	A=a
+query	http://www.host.test/	A=a
+query	http://www.host.test/some/path	A=a
+end
+test	Cookies are sorted by path length.
+from	http://www.host.test/
+set	A=a; path=/foo/bar
+set	B=b; path=/foo/bar/baz/qux
+set	C=c; path=/foo/bar/baz
+set	D=d; path=/foo
+content	A=a B=b C=c D=d
+query	http://www.host.test/foo/bar/baz/qux	B=b C=c A=a D=d
+query	http://www.host.test/foo/bar/baz/	C=c A=a D=d
+query	http://www.host.test/foo/bar	A=a D=d
+end
+test	Creation time determines sorting on same length paths.
+from	http://www.host.test/
+set	A=a; path=/foo/bar
+set	X=x; path=/foo/bar
+set	Y=y; path=/foo/bar/baz/qux
+set	B=b; path=/foo/bar/baz/qux
+set	C=c; path=/foo/bar/baz
+set	W=w; path=/foo/bar/baz
+set	Z=z; path=/foo
+set	D=d; path=/foo
+content	A=a B=b C=c D=d W=w X=x Y=y Z=z
+query	http://www.host.test/foo/bar/baz/qux	Y=y B=b C=c W=w A=a X=x Z=z D=d
+query	http://www.host.test/foo/bar/baz/	C=c W=w A=a X=x Z=z D=d
+query	http://www.host.test/foo/bar	A=a X=x Z=z D=d
+end
+test	Sorting of same-name cookies.
+from	http://www.host.test/
+set	A=1; path=/
+set	A=2; path=/path
+set	A=3; path=/quux
+set	A=4; path=/path/foo
+set	A=5; domain=.host.test; path=/path
+set	A=6; domain=.host.test; path=/quux
+set	A=7; domain=.host.test; path=/path/foo
+content	A=1 A=2 A=3 A=4 A=5 A=6 A=7
+query	http://www.host.test/path	A=2 A=5 A=1
+query	http://www.host.test/path/foo	A=4 A=7 A=2 A=5 A=1
+end
+test	Disallow domain cookie on public suffix.
+from	http://www.bbc.co.uk
+set	a=1
+set	b=2; domain=co.uk
+content	a=1
+query	http://www.bbc.co.uk	a=1
+end
+test	Host cookie on IP.
+from	http://192.168.0.10
+set	a=1
+content	a=1
+query	http://192.168.0.10	a=1
+end
+test	Domain cookies on IP.
+from	http://192.168.0.10
+set	a=1; domain=192.168.0.10
+set	b=2; domain=172.31.9.9
+set	c=3; domain=.192.168.0.10
+content	a=1
+query	http://192.168.0.10	a=1
+query	http://172.31.9.9	
+query	http://www.fancy.192.168.0.10	
+end
+test	Port is ignored #1.
+from	http://www.host.test/
+set	a=1
+content	a=1
+query	http://www.host.test	a=1
+query	http://www.host.test:8080/	a=1
+end
+test	Port is ignored #2.
+from	http://www.host.test:8080/
+set	a=1
+content	a=1
+query	http://www.host.test	a=1
+query	http://www.host.test:8080/	a=1
+query	http://www.host.test:1234/	a=1
+end
+test	IPv6 zone is not treated as a host.
+from	https://example.com/
+set	a=1
+content	a=1
+query	https://[::1%25.example.com]:80/	
+end
+test	Retrieval of cookies with quoted values
+from	http://www.host.test/
+set	cookie-1="quoted"
+set	cookie-2="quoted with spaces"
+set	cookie-3="quoted,with,commas"
+set	cookie-4= ,
+content	cookie-1="quoted" cookie-2="quoted with spaces" cookie-3="quoted,with,commas" cookie-4=" ,"
+query	http://www.host.test	cookie-1="quoted" cookie-2="quoted with spaces" cookie-3="quoted,with,commas" cookie-4=" ,"
+end
+group	updateAndDeleteTests	shared
+test	Set initial cookies.
+from	http://www.host.test
+set	a=1
+set	b=2; secure
+set	c=3; httponly
+set	d=4; secure; httponly
+content	a=1 b=2 c=3 d=4
+query	http://www.host.test	a=1 c=3
+query	https://www.host.test	a=1 b=2 c=3 d=4
+end
+test	Update value via http.
+from	http://www.host.test
+set	a=w
+set	b=x; secure
+set	c=y; httponly
+set	d=z; secure; httponly
+content	a=w b=x c=y d=z
+query	http://www.host.test	a=w c=y
+query	https://www.host.test	a=w b=x c=y d=z
+end
+test	Clear Secure flag from an http.
+from	http://www.host.test/
+set	b=xx
+set	d=zz; httponly
+content	a=w b=xx c=y d=zz
+query	http://www.host.test	a=w b=xx c=y d=zz
+end
+test	Delete all.
+from	http://www.host.test/
+set	a=1; max-Age=-1
+set	b=2; expires=Tue, 01 Jan 2013 11:59:50 UTC
+set	c=2; max-age=-1; expires=Tue, 01 Jan 2013 11:59:50 UTC
+set	d=4; max-age=-1; expires=Tue, 01 Jan 2013 12:00:10 UTC
+content	
+query	http://www.host.test	
+end
+test	Refill #1.
+from	http://www.host.test
+set	A=1
+set	A=2; path=/foo
+set	A=3; domain=.host.test
+set	A=4; path=/foo; domain=.host.test
+content	A=1 A=2 A=3 A=4
+query	http://www.host.test/foo	A=2 A=4 A=1 A=3
+end
+test	Refill #2.
+from	http://www.google.com
+set	A=6
+set	A=7; path=/foo
+set	A=8; domain=.google.com
+set	A=9; path=/foo; domain=.google.com
+content	A=1 A=2 A=3 A=4 A=6 A=7 A=8 A=9
+query	http://www.host.test/foo	A=2 A=4 A=1 A=3
+query	http://www.google.com/foo	A=7 A=9 A=6 A=8
+end
+test	Delete A7.
+from	http://www.google.com
+set	A=; path=/foo; max-age=-1
+content	A=1 A=2 A=3 A=4 A=6 A=8 A=9
+query	http://www.host.test/foo	A=2 A=4 A=1 A=3
+query	http://www.google.com/foo	A=9 A=6 A=8
+end
+test	Delete A4.
+from	http://www.host.test
+set	A=; path=/foo; domain=host.test; max-age=-1
+content	A=1 A=2 A=3 A=6 A=8 A=9
+query	http://www.host.test/foo	A=2 A=1 A=3
+query	http://www.google.com/foo	A=9 A=6 A=8
+end
+test	Delete A6.
+from	http://www.google.com
+set	A=; max-age=-1
+content	A=1 A=2 A=3 A=8 A=9
+query	http://www.host.test/foo	A=2 A=1 A=3
+query	http://www.google.com/foo	A=9 A=8
+end
+test	Delete A3.
+from	http://www.host.test
+set	A=; domain=host.test; max-age=-1
+content	A=1 A=2 A=8 A=9
+query	http://www.host.test/foo	A=2 A=1
+query	http://www.google.com/foo	A=9 A=8
+end
+test	No cross-domain delete.
+from	http://www.host.test
+set	A=; domain=google.com; max-age=-1
+set	A=; path=/foo; domain=google.com; max-age=-1
+content	A=1 A=2 A=8 A=9
+query	http://www.host.test/foo	A=2 A=1
+query	http://www.google.com/foo	A=9 A=8
+end
+test	Delete A8 and A9.
+from	http://www.google.com
+set	A=; domain=google.com; max-age=-1
+set	A=; path=/foo; domain=google.com; max-age=-1
+content	A=1 A=2
+query	http://www.host.test/foo	A=2 A=1
+query	http://www.google.com/foo	
+end
+group	chromiumBasicsTests	fresh
+test	DomainWithTrailingDotTest.
+from	http://www.google.com/
+set	a=1; domain=.www.google.com.
+set	b=2; domain=.www.google.com..
+content	
+query	http://www.google.com	
+end
+test	ValidSubdomainTest #1.
+from	http://a.b.c.d.com
+set	a=1; domain=.a.b.c.d.com
+set	b=2; domain=.b.c.d.com
+set	c=3; domain=.c.d.com
+set	d=4; domain=.d.com
+content	a=1 b=2 c=3 d=4
+query	http://a.b.c.d.com	a=1 b=2 c=3 d=4
+query	http://b.c.d.com	b=2 c=3 d=4
+query	http://c.d.com	c=3 d=4
+query	http://d.com	d=4
+end
+test	ValidSubdomainTest #2.
+from	http://a.b.c.d.com
+set	a=1; domain=.a.b.c.d.com
+set	b=2; domain=.b.c.d.com
+set	c=3; domain=.c.d.com
+set	d=4; domain=.d.com
+set	X=bcd; domain=.b.c.d.com
+set	X=cd; domain=.c.d.com
+content	X=bcd X=cd a=1 b=2 c=3 d=4
+query	http://b.c.d.com	b=2 c=3 d=4 X=bcd X=cd
+query	http://c.d.com	c=3 d=4 X=cd
+end
+test	InvalidDomainTest #1.
+from	http://foo.bar.com
+set	a=1; domain=.yo.foo.bar.com
+set	b=2; domain=.foo.com
+set	c=3; domain=.bar.foo.com
+set	d=4; domain=.foo.bar.com.net
+set	e=5; domain=ar.com
+set	f=6; domain=.
+set	g=7; domain=/
+set	h=8; domain=http://foo.bar.com
+set	i=9; domain=..foo.bar.com
+set	j=10; domain=..bar.com
+set	k=11; domain=.foo.bar.com?blah
+set	l=12; domain=.foo.bar.com/blah
+set	m=12; domain=.foo.bar.com:80
+set	n=14; domain=.foo.bar.com:
+set	o=15; domain=.foo.bar.com#sup
+content	
+query	http://foo.bar.com	
+end
+test	InvalidDomainTest #2.
+from	http://foo.com.com
+set	a=1; domain=.foo.com.com.com
+content	
+query	http://foo.bar.com	
+end
+test	DomainWithoutLeadingDotTest #1.
+from	http://manage.hosted.filefront.com
+set	a=1; domain=filefront.com
+content	a=1
+query	http://www.filefront.com	a=1
+end
+test	DomainWithoutLeadingDotTest #2.
+from	http://www.google.com
+set	a=1; domain=www.google.com
+content	a=1
+query	http://www.google.com	a=1
+query	http://sub.www.google.com	a=1
+query	http://something-else.com	
+end
+test	CaseInsensitiveDomainTest.
+from	http://www.google.com
+set	a=1; domain=.GOOGLE.COM
+set	b=2; domain=.www.gOOgLE.coM
+content	a=1 b=2
+query	http://www.google.com	a=1 b=2
+end
+test	TestIpAddress #1.
+from	http://1.2.3.4/foo
+set	a=1; path=/
+content	a=1
+query	http://1.2.3.4/foo	a=1
+end
+test	TestIpAddress #2.
+from	http://1.2.3.4/foo
+set	a=1; domain=.1.2.3.4
+set	b=2; domain=.3.4
+content	
+query	http://1.2.3.4/foo	
+end
+test	TestIpAddress #3.
+from	http://1.2.3.4/foo
+set	a=1; domain=1.2.3.3
+content	
+query	http://1.2.3.4/foo	
+end
+test	TestIpAddress #4.
+from	http://1.2.3.4/foo
+set	a=1; domain=1.2.3.4
+content	a=1
+query	http://1.2.3.4/foo	a=1
+end
+test	TestNonDottedAndTLD #2.
+from	http://com./index.html
+set	a=1
+content	a=1
+query	http://com./index.html	a=1
+query	http://no-cookies.com./index.html	
+end
+test	TestNonDottedAndTLD #3.
+from	http://a.b
+set	a=1; domain=.b
+set	b=2; domain=b
+content	
+query	http://bar.foo	
+end
+test	TestNonDottedAndTLD #4.
+from	http://google.com
+set	a=1; domain=.com
+set	b=2; domain=com
+content	
+query	http://google.com	
+end
+test	TestNonDottedAndTLD #5.
+from	http://google.co.uk
+set	a=1; domain=.co.uk
+set	b=2; domain=.uk
+content	
+query	http://google.co.uk	
+query	http://else.co.com	
+query	http://else.uk	
+end
+test	TestHostEndsWithDot.
+from	http://www.google.com
+set	a=1
+set	b=2; domain=.www.google.com.
+content	a=1
+query	http://www.google.com	a=1
+end
+test	PathTest
+from	http://www.google.izzle
+set	a=1; path=/wee
+content	a=1
+query	http://www.google.izzle/wee	a=1
+query	http://www.google.izzle/wee/	a=1
+query	http://www.google.izzle/wee/war	a=1
+query	http://www.google.izzle/wee/war/more/more	a=1
+query	http://www.google.izzle/weehee	
+query	http://www.google.izzle/	
+end
+group	chromiumDomainTests	shared
+test	Fill #1.
+from	http://www.google.izzle
+set	A=B
+content	A=B
+query	http://www.google.izzle	A=B
+end
+test	Fill #2.
+from	http://www.google.izzle
+set	C=D; domain=.google.izzle
+content	A=B C=D
+query	http://www.google.izzle	A=B C=D
+end
+test	Verify A is a host cookie and not accessible from subdomain.
+from	http://unused.nil
+content	A=B C=D
+query	http://foo.www.google.izzle	C=D
+end
+test	Verify domain cookies are found on proper domain.
+from	http://www.google.izzle
+set	E=F; domain=.www.google.izzle
+content	A=B C=D E=F
+query	http://www.google.izzle	A=B C=D E=F
+end
+test	Leading dots in domain attributes are optional.
+from	http://www.google.izzle
+set	G=H; domain=www.google.izzle
+content	A=B C=D E=F G=H
+query	http://www.google.izzle	A=B C=D E=F G=H
+end
+test	Verify domain enforcement works #1.
+from	http://www.google.izzle
+set	K=L; domain=.bar.www.google.izzle
+content	A=B C=D E=F G=H
+query	http://bar.www.google.izzle	C=D E=F G=H
+end
+test	Verify domain enforcement works #2.
+from	http://unused.nil
+content	A=B C=D E=F G=H
+query	http://www.google.izzle	A=B C=D E=F G=H
+end
+group	chromiumDeletionTests	shared
+test	Create session cookie a1.
+from	http://www.google.com
+set	a=1
+content	a=1
+query	http://www.google.com	a=1
+end
+test	Delete sc a1 via MaxAge.
+from	http://www.google.com
+set	a=1; max-age=-1
+content	
+query	http://www.google.com	
+end
+test	Create session cookie b2.
+from	http://www.google.com
+set	b=2
+content	b=2
+query	http://www.google.com	b=2
+end
+test	Delete sc b2 via Expires.
+from	http://www.google.com
+set	b=2; expires=Tue, 01 Jan 2013 11:59:50 UTC
+content	
+query	http://www.google.com	
+end
+test	Create persistent cookie c3.
+from	http://www.google.com
+set	c=3; max-age=3600
+content	c=3
+query	http://www.google.com	c=3
+end
+test	Delete pc c3 via MaxAge.
+from	http://www.google.com
+set	c=3; max-age=-1
+content	
+query	http://www.google.com	
+end
+test	Create persistent cookie d4.
+from	http://www.google.com
+set	d=4; max-age=3600
+content	d=4
+query	http://www.google.com	d=4
+end
+test	Delete pc d4 via Expires.
+from	http://www.google.com
+set	d=4; expires=Tue, 01 Jan 2013 11:59:50 UTC
+content	
+query	http://www.google.com	
+end
+group	domainHandlingTests	fresh
+test	Host cookie
+from	http://www.host.test
+set	a=1
+content	a=1
+query	http://www.host.test	a=1
+query	http://host.test	
+query	http://bar.host.test	
+query	http://foo.www.host.test	
+query	http://other.test	
+query	http://test	
+end
+test	Domain cookie #1
+from	http://www.host.test
+set	a=1; domain=host.test
+content	a=1
+query	http://www.host.test	a=1
+query	http://host.test	a=1
+query	http://bar.host.test	a=1
+query	http://foo.www.host.test	a=1
+query	http://other.test	
+query	http://test	
+end
+test	Domain cookie #2
+from	http://www.host.test
+set	a=1; domain=.host.test
+content	a=1
+query	http://www.host.test	a=1
+query	http://host.test	a=1
+query	http://bar.host.test	a=1
+query	http://foo.www.host.test	a=1
+query	http://other.test	
+query	http://test	
+end
+test	Host cookie on IDNA domain #1
+from	http://www.bücher.test
+set	a=1
+content	a=1
+query	http://www.bücher.test	a=1
+query	http://www.xn--bcher-kva.test	a=1
+query	http://bücher.test	
+query	http://xn--bcher-kva.test	
+query	http://bar.bücher.test	
+query	http://bar.xn--bcher-kva.test	
+query	http://foo.www.bücher.test	
+query	http://foo.www.xn--bcher-kva.test	
+query	http://other.test	
+query	http://test	
+end
+test	Host cookie on IDNA domain #2
+from	http://www.xn--bcher-kva.test
+set	a=1
+content	a=1
+query	http://www.bücher.test	a=1
+query	http://www.xn--bcher-kva.test	a=1
+query	http://bücher.test	
+query	http://xn--bcher-kva.test	
+query	http://bar.bücher.test	
+query	http://bar.xn--bcher-kva.test	
+query	http://foo.www.bücher.test	
+query	http://foo.www.xn--bcher-kva.test	
+query	http://other.test	
+query	http://test	
+end
+test	Domain cookie on IDNA domain #1
+from	http://www.bücher.test
+set	a=1; domain=xn--bcher-kva.test
+content	a=1
+query	http://www.bücher.test	a=1
+query	http://www.xn--bcher-kva.test	a=1
+query	http://bücher.test	a=1
+query	http://xn--bcher-kva.test	a=1
+query	http://bar.bücher.test	a=1
+query	http://bar.xn--bcher-kva.test	a=1
+query	http://foo.www.bücher.test	a=1
+query	http://foo.www.xn--bcher-kva.test	a=1
+query	http://other.test	
+query	http://test	
+end
+test	Domain cookie on IDNA domain #2
+from	http://www.xn--bcher-kva.test
+set	a=1; domain=xn--bcher-kva.test
+content	a=1
+query	http://www.bücher.test	a=1
+query	http://www.xn--bcher-kva.test	a=1
+query	http://bücher.test	a=1
+query	http://xn--bcher-kva.test	a=1
+query	http://bar.bücher.test	a=1
+query	http://bar.xn--bcher-kva.test	a=1
+query	http://foo.www.bücher.test	a=1
+query	http://foo.www.xn--bcher-kva.test	a=1
+query	http://other.test	
+query	http://test	
+end
+test	Host cookie on TLD.
+from	http://com
+set	a=1
+content	a=1
+query	http://com	a=1
+query	http://any.com	
+query	http://any.test	
+end
+test	Domain cookie on TLD becomes a host cookie.
+from	http://com
+set	a=1; domain=com
+content	a=1
+query	http://com	a=1
+query	http://any.com	
+query	http://any.test	
+end
+test	Host cookie on public suffix.
+from	http://co.uk
+set	a=1
+content	a=1
+query	http://co.uk	a=1
+query	http://uk	
+query	http://some.co.uk	
+query	http://foo.some.co.uk	
+query	http://any.uk	
+end
+test	Domain cookie on public suffix is ignored.
+from	http://some.co.uk
+set	a=1; domain=co.uk
+content	
+query	http://co.uk	
+query	http://uk	
+query	http://some.co.uk	
+query	http://foo.some.co.uk	
+query	http://any.uk	
+end
+group	expirationTests	fresh
+test	Expiration.
+from	http://www.host.test
+set	a=1
+set	b=2; max-age=3
+set	c=3; expires=Tue, 01 Jan 2013 12:00:03 UTC
+set	d=4; max-age=5
+set	e=5; expires=Tue, 01 Jan 2013 12:00:05 UTC
+set	f=6; max-age=100
+content	a=1 b=2 c=3 d=4 e=5 f=6
+query	http://www.host.test	a=1 b=2 c=3 d=4 e=5 f=6
+query	http://www.host.test	a=1 d=4 e=5 f=6
+query	http://www.host.test	a=1 d=4 e=5 f=6
+query	http://www.host.test	a=1 f=6
+query	http://www.host.test	a=1 f=6
+end

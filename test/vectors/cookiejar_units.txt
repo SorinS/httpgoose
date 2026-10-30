@@ -1,0 +1,160 @@
+# Go's net/http/cookiejar jar_test.go tables (go version go1.27.1 darwin/arm64), from scripts/gen_cookie_vectors.py
+jarKey		
+jarKey	.	.
+jarKey	..	.
+jarKey	.net	.net
+jarKey	192.168.0.5	192.168.0.5
+jarKey	a.	a.
+jarKey	b.a.	a.
+jarKey	bbc.co.uk	bbc.co.uk
+jarKey	co.uk	co.uk
+jarKey	com	com
+jarKey	example.com	example.com
+jarKey	foo.www.bbc.co.uk	bbc.co.uk
+jarKey	foo.www.example.com	example.com
+jarKey	uk	uk
+jarKey	weird.stuff..	.
+jarKey	www.bbc.co.uk	bbc.co.uk
+jarKey	www.buggy.psl	www.buggy.psl
+jarKey	www.example.com	example.com
+jarKey	www2.buggy.psl	buggy.psl
+jarKeyNilPSL		
+jarKeyNilPSL	.	.
+jarKeyNilPSL	..	..
+jarKeyNilPSL	.net	.net
+jarKeyNilPSL	192.168.0.5	192.168.0.5
+jarKeyNilPSL	a.	a.
+jarKeyNilPSL	b.a.	a.
+jarKeyNilPSL	bbc.co.uk	co.uk
+jarKeyNilPSL	co.uk	co.uk
+jarKeyNilPSL	com	com
+jarKeyNilPSL	example.com	example.com
+jarKeyNilPSL	foo.www.bbc.co.uk	co.uk
+jarKeyNilPSL	foo.www.example.com	example.com
+jarKeyNilPSL	uk	uk
+jarKeyNilPSL	weird.stuff..	stuff..
+jarKeyNilPSL	www.bbc.co.uk	co.uk
+jarKeyNilPSL	www.example.com	example.com
+defaultPath		/
+defaultPath	/	/
+defaultPath	//	/
+defaultPath	/a/../b	/a/..
+defaultPath	/a/./b	/a/.
+defaultPath	/a//b	/a/
+defaultPath	/a/b/c.html	/a/b
+defaultPath	/abc	/
+defaultPath	/abc/	/abc
+defaultPath	/abc/xyz	/abc
+defaultPath	/abc/xyz/	/abc/xyz
+defaultPath	strange	/
+isIP	1.1.1.300	false
+isIP	1.2.3.4	true
+isIP	123.foo.bar.net	false
+isIP	127.0.0.1	true
+isIP	2001:4860:0:2001::68	true
+isIP	::1%zone	true
+isIP	example.com	false
+isIP	www.foo.bar.net	false
+canonicalHost	.	
+canonicalHost	..	.
+canonicalHost	...	..
+canonicalHost	.net	.net
+canonicalHost	.net.	.net
+canonicalHost	192.168.0.10	192.168.0.10
+canonicalHost	192.168.0.5:8080	192.168.0.5
+canonicalHost	2001:4860:0:2001::68	2001:4860:0:2001::68
+canonicalHost	WWW.EXAMPLE.COM	www.example.com
+canonicalHost	[2001:4860:0:::68]:8080	2001:4860:0:::68
+canonicalHost	[bad.unmatched.bracket:	error
+canonicalHost	a..	a.
+canonicalHost	b.a..	b.a.
+canonicalHost	wWw.eXAmple.CoM	www.example.com
+canonicalHost	weird.stuff...	weird.stuff..
+canonicalHost	www.bücher.de	www.xn--bcher-kva.de
+canonicalHost	www.example.com	www.example.com
+canonicalHost	www.example.com.	www.example.com
+canonicalHost	www.example.com:80	www.example.com
+hasDotSuffix			false
+hasDotSuffix		.	false
+hasDotSuffix		x	false
+hasDotSuffix	.		true
+hasDotSuffix	.	.	false
+hasDotSuffix	.	..	false
+hasDotSuffix	.	x	false
+hasDotSuffix	.	x.	false
+hasDotSuffix	.	.x	false
+hasDotSuffix	.	.x.	false
+hasDotSuffix	x		false
+hasDotSuffix	x	.	false
+hasDotSuffix	x	..	false
+hasDotSuffix	x	x	false
+hasDotSuffix	x	x.	false
+hasDotSuffix	x	.x	false
+hasDotSuffix	x	.x.	false
+hasDotSuffix	.x		false
+hasDotSuffix	.x	.	false
+hasDotSuffix	.x	..	false
+hasDotSuffix	.x	x	true
+hasDotSuffix	.x	x.	false
+hasDotSuffix	.x	.x	false
+hasDotSuffix	.x	.x.	false
+hasDotSuffix	x.		true
+hasDotSuffix	x.	.	false
+hasDotSuffix	x.	..	false
+hasDotSuffix	x.	x	false
+hasDotSuffix	x.	x.	false
+hasDotSuffix	x.	.x	false
+hasDotSuffix	x.	.x.	false
+hasDotSuffix	com		false
+hasDotSuffix	com	m	false
+hasDotSuffix	com	om	false
+hasDotSuffix	com	com	false
+hasDotSuffix	com	.com	false
+hasDotSuffix	com	x.com	false
+hasDotSuffix	com	xcom	false
+hasDotSuffix	com	xorg	false
+hasDotSuffix	com	org	false
+hasDotSuffix	com	rg	false
+hasDotSuffix	foo.com		false
+hasDotSuffix	foo.com	m	false
+hasDotSuffix	foo.com	om	false
+hasDotSuffix	foo.com	com	true
+hasDotSuffix	foo.com	.com	false
+hasDotSuffix	foo.com	o.com	false
+hasDotSuffix	foo.com	oo.com	false
+hasDotSuffix	foo.com	foo.com	false
+hasDotSuffix	foo.com	.foo.com	false
+hasDotSuffix	foo.com	x.foo.com	false
+hasDotSuffix	foo.com	xfoo.com	false
+hasDotSuffix	foo.com	xfoo.org	false
+hasDotSuffix	foo.com	foo.org	false
+hasDotSuffix	foo.com	oo.org	false
+hasDotSuffix	foo.com	o.org	false
+hasDotSuffix	foo.com	.org	false
+hasDotSuffix	foo.com	org	false
+hasDotSuffix	foo.com	rg	false
+domainAndType	www.example.com		www.example.com	true	true
+domainAndType	127.0.0.1		127.0.0.1	true	true
+domainAndType	2001:4860:0:2001::68		2001:4860:0:2001::68	true	true
+domainAndType	www.example.com	example.com	example.com	false	true
+domainAndType	www.example.com	.example.com	example.com	false	true
+domainAndType	www.example.com	www.example.com	www.example.com	false	true
+domainAndType	www.example.com	.www.example.com	www.example.com	false	true
+domainAndType	foo.sso.example.com	sso.example.com	sso.example.com	false	true
+domainAndType	bar.co.uk	bar.co.uk	bar.co.uk	false	true
+domainAndType	foo.bar.co.uk	.bar.co.uk	bar.co.uk	false	true
+domainAndType	127.0.0.1	127.0.0.1	127.0.0.1	true	true
+domainAndType	2001:4860:0:2001::68	2001:4860:0:2001::68	2001:4860:0:2001::68	true	true
+domainAndType	www.example.com	.		false	false
+domainAndType	www.example.com	..		false	false
+domainAndType	www.example.com	other.com		false	false
+domainAndType	www.example.com	com		false	false
+domainAndType	www.example.com	.com		false	false
+domainAndType	foo.bar.co.uk	.co.uk		false	false
+domainAndType	127.www.0.0.1	127.0.0.1		false	false
+domainAndType	com		com	true	true
+domainAndType	com	com	com	true	true
+domainAndType	com	.com	com	true	true
+domainAndType	co.uk		co.uk	true	true
+domainAndType	co.uk	co.uk	co.uk	true	true
+domainAndType	co.uk	.co.uk	co.uk	true	true
