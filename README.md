@@ -90,6 +90,13 @@ Limits (`http::Limits`): 64 KiB of head (431), 8 KiB of request line
 (414), 128 field lines (431), 4 KiB of extensions on a chunk line, 16 KiB
 of trailer.
 
+## Requirements
+
+`http.client` and `http.fetch` keep a client's parts (its pool, buffers,
+TLS settings, cookie jar) in a `root struct`, which needs a compiler from
+goose.git 704214cc on (v2026.3-252 is what the tests ran with). The
+parsers and the other modules need none of it, and no C.
+
 ## Tools
 
 `tools/httpd.goose` (goose-httpd) serves static files over HTTP/1.1, plain
@@ -117,6 +124,7 @@ python3 scripts/run_tests.py [--native]        # test/*.goose at -O0, -O2, --deb
 python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
 python3 scripts/url_differential.py [--seed N] [--random N] [-v]
 python3 scripts/flate_differential.py [--seed N] [--count N] [-v]
+python3 scripts/httpnet_check.py [--cc CC | --msvc]   # src/httpnet.c alone, also on Windows
 python3 scripts/gen_cookie_vectors.py      # Go's cookiejar tables -> test/vectors/cookiejar*.txt
 python3 scripts/gen_proxy_vectors.py       # x/net's httpproxy tables -> test/vectors/proxy.txt
 ```
