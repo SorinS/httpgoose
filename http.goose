@@ -128,9 +128,81 @@ fn trim_ows(s: const u8[:]) -> const u8[:] {
 
 // --- Status codes (§15) ----------------------------------------------------
 
+let STATUS_CONTINUE: i64 = 100;
+let STATUS_SWITCHING_PROTOCOLS: i64 = 101;
+let STATUS_PROCESSING: i64 = 102;
+let STATUS_EARLY_HINTS: i64 = 103;
+let STATUS_OK: i64 = 200;
+let STATUS_CREATED: i64 = 201;
+let STATUS_ACCEPTED: i64 = 202;
+let STATUS_NON_AUTHORITATIVE_INFO: i64 = 203;
+let STATUS_NO_CONTENT: i64 = 204;
+let STATUS_RESET_CONTENT: i64 = 205;
+let STATUS_PARTIAL_CONTENT: i64 = 206;
+let STATUS_MULTI_STATUS: i64 = 207;
+let STATUS_ALREADY_REPORTED: i64 = 208;
+let STATUS_IM_USED: i64 = 226;
+let STATUS_MULTIPLE_CHOICES: i64 = 300;
+let STATUS_MOVED_PERMANENTLY: i64 = 301;
+let STATUS_FOUND: i64 = 302;
+let STATUS_SEE_OTHER: i64 = 303;
+let STATUS_NOT_MODIFIED: i64 = 304;
+let STATUS_USE_PROXY: i64 = 305;
+let STATUS_TEMPORARY_REDIRECT: i64 = 307;
+let STATUS_PERMANENT_REDIRECT: i64 = 308;
+let STATUS_BAD_REQUEST: i64 = 400;
+let STATUS_UNAUTHORIZED: i64 = 401;
+let STATUS_PAYMENT_REQUIRED: i64 = 402;
+let STATUS_FORBIDDEN: i64 = 403;
+let STATUS_NOT_FOUND: i64 = 404;
+let STATUS_METHOD_NOT_ALLOWED: i64 = 405;
+let STATUS_NOT_ACCEPTABLE: i64 = 406;
+let STATUS_PROXY_AUTH_REQUIRED: i64 = 407;
+let STATUS_REQUEST_TIMEOUT: i64 = 408;
+let STATUS_CONFLICT: i64 = 409;
+let STATUS_GONE: i64 = 410;
+let STATUS_LENGTH_REQUIRED: i64 = 411;
+let STATUS_PRECONDITION_FAILED: i64 = 412;
+let STATUS_REQUEST_ENTITY_TOO_LARGE: i64 = 413;
+let STATUS_URI_TOO_LONG: i64 = 414;
+let STATUS_UNSUPPORTED_MEDIA_TYPE: i64 = 415;
+let STATUS_REQUESTED_RANGE_NOT_SATISFIABLE: i64 = 416;
+let STATUS_EXPECTATION_FAILED: i64 = 417;
+let STATUS_TEAPOT: i64 = 418;
+let STATUS_MISDIRECTED_REQUEST: i64 = 421;
+let STATUS_UNPROCESSABLE_ENTITY: i64 = 422;
+let STATUS_LOCKED: i64 = 423;
+let STATUS_FAILED_DEPENDENCY: i64 = 424;
+let STATUS_TOO_EARLY: i64 = 425;
+let STATUS_UPGRADE_REQUIRED: i64 = 426;
+let STATUS_PRECONDITION_REQUIRED: i64 = 428;
+let STATUS_TOO_MANY_REQUESTS: i64 = 429;
+let STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE: i64 = 431;
+let STATUS_UNAVAILABLE_FOR_LEGAL_REASONS: i64 = 451;
+let STATUS_INTERNAL_SERVER_ERROR: i64 = 500;
+let STATUS_NOT_IMPLEMENTED: i64 = 501;
+let STATUS_BAD_GATEWAY: i64 = 502;
+let STATUS_SERVICE_UNAVAILABLE: i64 = 503;
+let STATUS_GATEWAY_TIMEOUT: i64 = 504;
+let STATUS_HTTP_VERSION_NOT_SUPPORTED: i64 = 505;
+let STATUS_VARIANT_ALSO_NEGOTIATES: i64 = 506;
+let STATUS_INSUFFICIENT_STORAGE: i64 = 507;
+let STATUS_LOOP_DETECTED: i64 = 508;
+let STATUS_NOT_EXTENDED: i64 = 510;
+let STATUS_NETWORK_AUTHENTICATION_REQUIRED: i64 = 511;
+
+// The class of a status: 1 for 1xx (informational) up to 5 for 5xx; 0 for
+// a code out of range.
+fn status_class(status: i64) -> i64 { if status >= 100 && status <= 599 { status / 100 } else { 0 } }
+
+
+// The reason phrases of Go's http.StatusText: the IANA registry's codes
+// (RFC 9110 §15 and the RFCs that added the rest), "" for others.
 fn reason_phrase(status: i64) -> const u8[:] {
     if status == 100 { return "Continue"; }
     if status == 101 { return "Switching Protocols"; }
+    if status == 102 { return "Processing"; }
+    if status == 103 { return "Early Hints"; }
     if status == 200 { return "OK"; }
     if status == 201 { return "Created"; }
     if status == 202 { return "Accepted"; }
@@ -138,41 +210,57 @@ fn reason_phrase(status: i64) -> const u8[:] {
     if status == 204 { return "No Content"; }
     if status == 205 { return "Reset Content"; }
     if status == 206 { return "Partial Content"; }
+    if status == 207 { return "Multi-Status"; }
+    if status == 208 { return "Already Reported"; }
+    if status == 226 { return "IM Used"; }
     if status == 300 { return "Multiple Choices"; }
     if status == 301 { return "Moved Permanently"; }
     if status == 302 { return "Found"; }
     if status == 303 { return "See Other"; }
     if status == 304 { return "Not Modified"; }
+    if status == 305 { return "Use Proxy"; }
     if status == 307 { return "Temporary Redirect"; }
     if status == 308 { return "Permanent Redirect"; }
     if status == 400 { return "Bad Request"; }
     if status == 401 { return "Unauthorized"; }
+    if status == 402 { return "Payment Required"; }
     if status == 403 { return "Forbidden"; }
     if status == 404 { return "Not Found"; }
     if status == 405 { return "Method Not Allowed"; }
     if status == 406 { return "Not Acceptable"; }
+    if status == 407 { return "Proxy Authentication Required"; }
     if status == 408 { return "Request Timeout"; }
     if status == 409 { return "Conflict"; }
     if status == 410 { return "Gone"; }
     if status == 411 { return "Length Required"; }
     if status == 412 { return "Precondition Failed"; }
-    if status == 413 { return "Content Too Large"; }
-    if status == 414 { return "URI Too Long"; }
+    if status == 413 { return "Request Entity Too Large"; }
+    if status == 414 { return "Request URI Too Long"; }
     if status == 415 { return "Unsupported Media Type"; }
-    if status == 416 { return "Range Not Satisfiable"; }
+    if status == 416 { return "Requested Range Not Satisfiable"; }
     if status == 417 { return "Expectation Failed"; }
+    if status == 418 { return "I'm a teapot"; }
     if status == 421 { return "Misdirected Request"; }
-    if status == 422 { return "Unprocessable Content"; }
+    if status == 422 { return "Unprocessable Entity"; }
+    if status == 423 { return "Locked"; }
+    if status == 424 { return "Failed Dependency"; }
+    if status == 425 { return "Too Early"; }
     if status == 426 { return "Upgrade Required"; }
     if status == 428 { return "Precondition Required"; }
     if status == 429 { return "Too Many Requests"; }
     if status == 431 { return "Request Header Fields Too Large"; }
+    if status == 451 { return "Unavailable For Legal Reasons"; }
     if status == 500 { return "Internal Server Error"; }
     if status == 501 { return "Not Implemented"; }
     if status == 502 { return "Bad Gateway"; }
     if status == 503 { return "Service Unavailable"; }
     if status == 504 { return "Gateway Timeout"; }
     if status == 505 { return "HTTP Version Not Supported"; }
+    if status == 506 { return "Variant Also Negotiates"; }
+    if status == 507 { return "Insufficient Storage"; }
+    if status == 508 { return "Loop Detected"; }
+    if status == 510 { return "Not Extended"; }
+    if status == 511 { return "Network Authentication Required"; }
     return "";
 }
 
