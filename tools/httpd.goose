@@ -3,13 +3,16 @@
 //
 //   goose-httpd --root DIR [--listen 127.0.0.1] [--port 8080]
 //               [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]]
+//               [--late-ticket]
 //
 // GET and HEAD serve files under DIR (a directory's index.html); POST
 // /echo answers with the request's body; anything else is 405. Paths are
 // percent-decoded once, may not hold ".." segments or NUL, and must
 // resolve, symbolic links followed, to a file inside DIR. Each connection
 // is served by a process of its own; one line a request goes to stderr.
-// It listens on 127.0.0.1 unless told otherwise.
+// It listens on 127.0.0.1 unless told otherwise. --late-ticket (for
+// tests) sends another TLS 1.3 session ticket a moment after each
+// response, when the connection is idle.
 
 import std;
 import os;
@@ -24,6 +27,7 @@ import sysnet;
 
 let IDLE_MS: i32 = 30000;
 let MAX_FILE: i64 = 1 << 28;
+var late_ticket = false;
 
 fn die(msg: const u8[:]) {
     write_stderr("goose-httpd: ");
@@ -210,6 +214,11 @@ fn serve(fd: i32, root: const u8[:], on_tls: bool, scfg: const tls::ServerConfig
             if stop || ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR { break; }
         }
         if !flush(fd, on_tls, tc, plain, wire) { break; }
+        if late_ticket && on_tls && !stop && !http::closing(hc) && tls::version(tc) == tls::VERSION_TLS13 {
+            // After the client has had time to read the response.
+            sysnet::net_wait(fd, 200);
+            if tls::send_session_ticket(tc, scfg, wire) && !flush(fd, false, tc, plain, wire) { break; }
+        }
         if stop || http::closing(hc) {
             if on_tls { tls::close(tc, wire); flush(fd, false, tc, plain, wire); }
             break;
@@ -264,6 +273,7 @@ fn main() {
     tls_max.append("1.3");
     var i = 1;
     while i < a.len {
+        if a[i] == "--late-ticket" { late_ticket = true; i++; continue; }
         if i + 1 >= a.len { die("each option takes a value"); }
         let v = a[i + 1];
         if a[i] == "--root" { root.append(v); }
@@ -276,7 +286,7 @@ fn main() {
         else if a[i] == "--cert" { cert.append(v); }
         else if a[i] == "--key" { key.append(v); }
         else if a[i] == "--tls-max" { tls_max.clear(); tls_max.append(v); }
-        else { die("usage: goose-httpd --root DIR [--listen ADDR] [--port N] [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]]"); }
+        else { die("usage: goose-httpd --root DIR [--listen ADDR] [--port N] [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]] [--late-ticket]"); }
         i += 2;
     }
     if root.len == 0 { die("--root is required"); }

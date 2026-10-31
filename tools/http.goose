@@ -22,6 +22,7 @@
 //   --cacert FILE       trust these roots (PEM), not the system's; -k checks nothing
 //   --tls-max 1.2|1.3   the highest TLS version
 //   --connect-timeout S, -m S   seconds to connect, for the whole of each request
+//   --rate N/s|N/m|N/h  start at most N requests a second, minute or hour
 //   -s                  print no errors; -v: say what happens on stderr
 //
 // URLs are fetched in turn on one client, so connections to one origin are
@@ -104,6 +105,7 @@ fn main() {
     var cookie_out: u8[>..] = [];
     var cacert: u8[>..] = [];
     var tls12 = false;
+    var interval_ms: i64 = 0;
     var urls: u8[>..] = [];             // NUL-separated
     var i = 1;
     while i < a.len {
@@ -160,6 +162,15 @@ fn main() {
         }
         else if s == "--connect-timeout" && has_next { c.opt.connect_timeout_ms = seconds_ms(next); i += 2; }
         else if (s == "-m" || s == "--max-time") && has_next { c.opt.timeout_ms = seconds_ms(next); i += 2; }
+        else if s == "--rate" && has_next {
+            let slash = position(next, '/');
+            let n, ok = parse_int(if slash < 0 { next } else { next[..slash] });
+            let unit = if slash < 0 { "h" } else { next[slash + 1..] };
+            let per: i64 = if unit == "s" { 1000 } else if unit == "m" { 60000 } else if unit == "h" { 3600000 } else { 0 };
+            if !ok || n <= 0 || per == 0 { die("--rate is N/s, N/m or N/h"); }
+            interval_ms = per / n;
+            i += 2;
+        }
         else if s == "-s" || s == "--silent" { silent = true; i++; }
         else if s == "-v" || s == "--verbose" { verbose = true; i++; }
         else if s.len > 1 && s[0] == '-' { die("unknown option; see the comment at the top of tools/http.goose"); }
@@ -195,9 +206,15 @@ fn main() {
     }
     var status = 0;
     var out: u8[>..] = [];
+    var last_start: i64 = -1;
     each_split(urls, 0) {
         let us = it;
         if us.len > 0 {
+            if interval_ms > 0 {
+                let now = clock_ns() / 1000000;
+                if last_start >= 0 && now < last_start + interval_ms { sleep_ms(last_start + interval_ms - now); }
+                last_start = clock_ns() / 1000000;
+            }
             var r = http::fetch(c, method, us, fields, data);
             if r.err != http::ERR_NONE {
                 if r.err == http::ERR_REDIRECTS { say("too many redirects at ", http::response_url(r)); }
@@ -205,6 +222,9 @@ fn main() {
                 status = 1;
             } else {
                 note("from ", http::response_url(r));
+                note(if r.reused { "connection reused" } else { "new connection" },
+                     if r.tls_version == tls::VERSION_TLS13 { ", TLS 1.3" } else if r.tls_version == tls::VERSION_TLS12 { ", TLS 1.2" } else { "" });
+                if r.tls_resumed { note("TLS session resumed", ""); }
                 if include {
                     out.append("HTTP/1.");
                     format(out, r.minor);

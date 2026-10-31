@@ -10,7 +10,8 @@
 // policy: /redir?status=N&to=URL, /chain/N, /inspect (what arrived:
 // method, body length, fields), /setcookie?c=LINE..., /cookies, /basic
 // and /bearer (credentials alice:secret, token tok123), /gzip and
-// /gzip-bad (a 1 MiB body gzipped, and cut short), /slow (3 s). The
+// /gzip-bad (a 1 MiB body gzipped, and cut short), /slow (3 s), /tls
+// (the connection's TLS version, whether it resumed, and the protocol). The
 // client checks goose-httpd: files, HEAD, 404, bodies of several sizes,
 // chunked uploads, connection reuse, and the TLS version; one "ok NAME"
 // or "FAIL NAME: why" a line, exit status 1 if any failed.
@@ -19,7 +20,8 @@
 // over TLS with -cert; socks5 a SOCKS5 server (RFC 1928, RFC 1929's
 // password with -auth). Both connect names in -map to the address given
 // there (so a made-up name reaches a server on 127.0.0.1), and print a
-// line a request: "proxy METHOD TARGET" or "socks CONNECT HOST:PORT".
+// line a request: "proxy METHOD TARGET" (and " (resumed)" over a resumed
+// TLS session) or "socks CONNECT HOST:PORT".
 package main
 
 import (
@@ -275,6 +277,13 @@ func policy(mux *http.ServeMux) {
 			fmt.Fprintf(w, "%s: %s\n", k, strings.Join(r.Header[k], ", "))
 		}
 	})
+	mux.HandleFunc("/tls", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			io.WriteString(w, "none\n")
+			return
+		}
+		fmt.Fprintf(w, "version %s resumed %v proto %s\n", tls.VersionName(r.TLS.Version), r.TLS.DidResume, r.Proto)
+	})
 	mux.HandleFunc("/setcookie", func(w http.ResponseWriter, r *http.Request) {
 		for _, c := range r.URL.Query()["c"] {
 			w.Header().Add("Set-Cookie", c)
@@ -383,7 +392,11 @@ func proxyServe(addr, auth, cert, key string, m dialMap) {
 				return
 			}
 		}
-		logLine("proxy %s %s", r.Method, target)
+		if r.TLS != nil && r.TLS.DidResume {
+			logLine("proxy %s %s (resumed)", r.Method, target)
+		} else {
+			logLine("proxy %s %s", r.Method, target)
+		}
 		if r.Method == "CONNECT" {
 			up, err := net.Dial("tcp", m.addr(r.Host))
 			if err != nil {

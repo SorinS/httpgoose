@@ -447,6 +447,13 @@ def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
     check("proxy: an https proxy for http", rc == 0 and out == b"hello", err[:200])
     rc, out, err = gx("-x", f"https://localhost:{ps.port}", *tls, o_https)
     check("proxy: an https proxy for https (TLS in TLS)", rc == 0 and out == b"hello" and logged(ps, f"proxy CONNECT origin.test:{g13}"), err[:200])
+    # The session cache: the proxy's TLS and the origin's both resume on the
+    # second connection (Connection: close makes one a request).
+    o_tls = f"https://origin.test:{g13}/tls"
+    rc, out, err = gx("-x", f"https://localhost:{ps.port}", *tls, "-H", "Connection: close", o_tls, o_tls)
+    check("proxy: TLS in TLS, both resumed on the second connection",
+          rc == 0 and out == b"version TLS 1.3 resumed false proto HTTP/1.1\nversion TLS 1.3 resumed true proto HTTP/1.1\n"
+          and logged(ps, f"proxy CONNECT origin.test:{g13} (resumed)"), out[:200] + err[:200])
     rc, out, err = gx("-x", f"socks5h://127.0.0.1:{sx.port}", o_http)
     check("socks5: by name", rc == 0 and out == b"hello" and logged(sx, f"socks CONNECT origin.test:{g0}"), err[:200])
     rc, out, err = gx("-x", f"socks5://127.0.0.1:{sx.port}", *tls, o_https)
@@ -470,6 +477,29 @@ def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
     check("proxy: HTTP_PROXY not used under CGI", rc == 1 and b"resolve" in err, err[:200])
     rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", "--noproxy", "origin.test", o_http)
     check("proxy: --noproxy", rc == 1 and b"resolve" in err, err[:200])
+
+
+def session_cases(gh, cert, g12, g13, late, env_base):
+    """TLS session resumption, as Go's server reports it on /tls."""
+    def gx(*a):
+        p = subprocess.run([gh, "--cacert", cert, *a], capture_output=True, timeout=60, env=env_base)
+        return p.returncode, p.stdout, p.stderr
+    for port, v in ((g13, "1.3"), (g12, "1.2")):
+        u = f"https://localhost:{port}/tls"
+        rc, out, err = gx("-H", "Connection: close", u, u, u)
+        want = "".join(f"version TLS {v} resumed {r} proto HTTP/1.1\n" for r in ("false", "true", "true")).encode()
+        check(f"sessions: TLS {v}, new connections resume", rc == 0 and out == want, out[:300] + err[:200])
+    u = f"https://localhost:{g13}/tls"
+    rc, out, err = gx("-v", "-H", "Connection: close", "-k", u, u)
+    check("sessions: -k resumes too", rc == 0 and out.endswith(b"resumed true proto HTTP/1.1\n"), out[:300])
+    rc, out, err = gx("-H", "Connection: close", u, f"https://127.0.0.1:{g13}/tls")
+    check("sessions: one per server name (an address is another)", rc == 0 and out.count(b"resumed false") == 2, out[:300])
+    # A ticket that comes while the connection is idle is read, not taken
+    # for the end of the connection.
+    u = f"https://localhost:{late}/"
+    rc, out, err = gx("-v", "--rate", "2/s", u, u, u)
+    check("sessions: a late NewSessionTicket keeps the idle connection",
+          rc == 0 and err.count(b"connection reused") == 2, err[:400])
 
 
 PY10 = r'''
@@ -561,6 +591,9 @@ def main():
         servers.append(dg)
         fetch_cases(gh, gi, cert, g0.port, g13.port, dg.port, env_base)
         proxy_cases(gh, gi, cert, g0.port, g13.port, env_base, servers)
+        late = Server([httpd, "--root", www, "--port", "0", "--cert", cert, "--key", key, "--late-ticket"], port_re)
+        servers.append(late)
+        session_cases(gh, cert, g12.port, g13.port, late.port, env_base)
         bad = 0
         for s in servers:
             for l in s.log:

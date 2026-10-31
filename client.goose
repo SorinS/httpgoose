@@ -31,6 +31,7 @@ import cookie;
 import flate;
 import tls from "../tlsgoose.git";
 import tls.handshake;
+import tls.session;
 
 extern fn httpnet_connect(host: const u8[:], port: i32, timeout_ms: i32) -> i64;
 extern fn httpnet_read(fd: i64, buf: u8[:], timeout_ms: i32) -> i64;
@@ -92,6 +93,7 @@ struct ClientOptions {
     insecure: bool,                 // check no certificate (Go's InsecureSkipVerify)
     cookies: bool,                  // keep cookies in the client's jar and send them (Go's Client.Jar)
     auth: u8,                       // how the client's credentials are sent: AUTH_*
+    tls_sessions: i64,              // TLS sessions kept to resume, one per server name (0: none)
     user_agent: u8[..256],          // sent unless the request has one; empty: none
 }
 
@@ -106,7 +108,7 @@ fn client_options() -> ClientOptions {
     var o = ClientOptions {
         connect_timeout_ms: 30000, read_timeout_ms: 0, timeout_ms: 0, max_idle: 100, max_idle_per_host: 2,
         max_body: 1 << 30, max_redirects: 10, follow_redirects: true, compression: true, insecure: false,
-        cookies: false, auth: AUTH_ANY, user_agent: [],
+        cookies: false, auth: AUTH_ANY, tls_sessions: 64, user_agent: [],
     };
     o.user_agent.append("goose-http-client/1.1");
     return o;
@@ -122,6 +124,7 @@ struct PoolConn {
     reused: bool,                   // it has carried a request before this one
     last_used: i64,                 // clock_ns() when it went idle
     server_name: u8[..255],
+    sess_sig: u64,                  // the TLS session last put in the cache from it
     outer: i64,                     // the TLS to an https proxy beneath its own (c.outer), or -1
     via_proxy: bool,                // requests go to an HTTP proxy in absolute-form
     hc: ClientConn,
@@ -129,7 +132,7 @@ struct PoolConn {
 }
 
 // TLS to an https proxy, under a tunnel's own TLS.
-struct OuterTls { used: bool, server_name: u8[..255], tc: tls::Conn }
+struct OuterTls { used: bool, server_name: u8[..255], sess_sig: u64, tc: tls::Conn }
 
 // Where requests go: PROXY_NONE directly, PROXY_URL through one proxy for
 // every URL (Go's http.ProxyURL), PROXY_ENV by the environment's
@@ -164,6 +167,8 @@ root struct Client {
     proxy_authz: u8[>..] = [],      // the Proxy-Authorization value to send, if any
     proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
     proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
+    sessions: u8[>..] = [],         // the TLS session cache: records of session_put
+    session_seq: i64 = 0,
 }
 
 // A response, its head and what of the body read_all took. Its parts are
@@ -183,13 +188,17 @@ struct Response {
     conn: i64,                      // the pool slot its body is read from, -1 when done
     body_done: bool,
     decode: bool,                   // the body is gzip, decoded as it is read (Go's Uncompressed)
+    tls_version: u16,               // the connection's TLS version, 0 for none
+    tls_resumed: bool,              // its handshake resumed a session
+    reused: bool,                   // the connection had carried a request before (Go's GotConnInfo.Reused)
     data: u8[>..],
 }
 
 fn empty_response(err: i64) -> Response {
     Response {
         err: err, status: 0, minor: 1, reason: empty_span(), url: empty_span(), fields: empty_span(),
-        trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false, data: [],
+        trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false,
+        tls_version: 0, tls_resumed: false, reused: false, data: [],
     }
 }
 
@@ -293,7 +302,7 @@ fn close_idle(c: Client&) {
 fn new_slot(c: Client&) -> i64 {
     for i in c.conns.len { if !c.conns[i].used { return i; } }
     c.conns.push(PoolConn {
-        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, last_used: 0, server_name: [],
+        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, last_used: 0, server_name: [], sess_sig: 0,
         outer: -1, via_proxy: false, hc: client_conn(), tc: tls::client(c.tlscfg),
     });
     return c.conns.len - 1;
@@ -301,7 +310,7 @@ fn new_slot(c: Client&) -> i64 {
 
 fn new_outer(c: Client&) -> i64 {
     for k in c.outer.len { if !c.outer[k].used { c.outer[k].used = true; return k; } }
-    c.outer.push(OuterTls { used: true, server_name: [], tc: tls::client(c.tlscfg) });
+    c.outer.push(OuterTls { used: true, server_name: [], sess_sig: 0, tc: tls::client(c.tlscfg) });
     return c.outer.len - 1;
 }
 
@@ -312,8 +321,10 @@ fn take_idle(c: Client&, key: const u8[:]) -> i64 {
         let pc: PoolConn& = c.conns[i];
         if !pc.used || !pc.idle || pc.key[..] != key { continue; }
         // Something came while it was idle: its end, or bytes no request
-        // asked for. Either way it cannot carry a request.
-        if httpnet_readable(pc.fd) != 0 { conn_close(c, i); continue; }
+        // asked for, and then it cannot carry a request; or, on TLS, only
+        // handshake messages (a late NewSessionTicket, a KeyUpdate), read
+        // here.
+        if httpnet_readable(pc.fd) != 0 && !idle_drain(c, i) { conn_close(c, i); continue; }
         if best < 0 || pc.last_used > c.conns[best].last_used { best = i; }
     }
     if best >= 0 {
@@ -321,6 +332,30 @@ fn take_idle(c: Client&, key: const u8[:]) -> i64 {
         c.conns[best].reused = true;
     }
     return best;
+}
+
+// Reads what came on idle connection i: true if it was TLS's own messages
+// alone and the connection is still good.
+fn idle_drain(c: Client&, i: i64) -> bool {
+    if !c.conns[i].is_tls { return false; }
+    var app: u8[>..] = [];
+    var rounds = 0;
+    while httpnet_readable(c.conns[i].fd) != 0 {
+        rounds++;
+        if rounds > 16 { return false; }
+        c.mid.clear();
+        let n = link_read(c, i, c.mid, 1000);
+        if n <= 0 { c.mid.clear(); return false; }
+        c.wire.clear();
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(c.conns[i].server_name[..]);
+        let e = tls::client_feed(c.conns[i].tc, c.tlscfg, c.mid, c.wire, app);
+        c.mid.clear();
+        if c.wire.len > 0 { link_write_wire(c, i, 1000); }
+        if e != 0 || app.len > 0 || tls::closed(c.conns[i].tc) { return false; }
+        keep_session(c, i, false);
+    }
+    return true;
 }
 
 // Back to the pool, within the idle limits (the oldest idle ones go first),
@@ -357,6 +392,131 @@ fn conn_release(c: Client&, i: i64) {
         else if all > c.opt.max_idle { conn_close(c, oldest); }
         else { break; }
     }
+}
+
+// --- TLS sessions ------------------------------------------------------------
+
+// The cache of sessions to resume, as Go's LRU ClientSessionCache keyed by
+// server name: at most opt.tls_sessions, the least recently used going
+// first. Each record: the name's length (u8), the name, when it was last
+// used (u64), the session's length (u32) and tls::session_bytes.
+
+fn rd_u(b: const u8[:], pos: i64, n: i64) -> u64 {
+    var v: u64 = 0;
+    for k in n { v = (v << 8) | b[pos + k]; }
+    return v;
+}
+
+fn wr_u(out: u8[>..]&, v: u64, n: i64) {
+    for k in n { out.push(((v >> ((n - 1 - k) * 8) as! u64) & 0xff) as! u8); }
+}
+
+// Where the record for `name` starts, and its length; -1 if none.
+fn session_find(c: const Client&, name: const u8[:]) -> i64, i64 {
+    var pos = 0;
+    while pos < c.sessions.len {
+        let nl = c.sessions[pos] as i64;
+        let sl = rd_u(c.sessions, pos + 1 + nl + 8, 4) as! i64;
+        let size = 1 + nl + 8 + 4 + sl;
+        if c.sessions[pos + 1..pos + 1 + nl] == name { return pos, size; }
+        pos += size;
+    }
+    return -1, 0;
+}
+
+fn session_remove(c: Client&, pos: i64, size: i64) {
+    var rest: u8[>..] = [];
+    rest.append(c.sessions[pos + size..]);
+    c.sessions.resize(pos);
+    c.sessions.append(rest);
+}
+
+fn session_drop(c: Client&, name: const u8[:]) {
+    let pos, size = session_find(c, name);
+    if pos >= 0 { session_remove(c, pos, size); }
+}
+
+// The session kept for `name`, now the most recently used.
+fn session_get(c: Client&, name: const u8[:]) -> tls::Session, bool {
+    let pos, size = session_find(c, name);
+    if pos < 0 { return tls::no_session(), false; }
+    let nl = c.sessions[pos] as i64;
+    let at = pos + 1 + nl + 8 + 4;
+    let s, ok = tls::parse_session(c.sessions[at..pos + size]);
+    if !ok { session_remove(c, pos, size); return tls::no_session(), false; }
+    c.session_seq++;
+    var stamp: u8[>..] = [];
+    wr_u(stamp, c.session_seq as! u64, 8);
+    for k in 8 { c.sessions[pos + 1 + nl + k] = stamp[k]; }
+    return s, true;
+}
+
+fn session_put(c: Client&, name: const u8[:], s: const tls::Session&) {
+    if c.opt.tls_sessions <= 0 || name.len == 0 || name.len > 255 { return; }
+    session_drop(c, name);
+    // Room for it: the least recently used go.
+    while true {
+        var count = 0;
+        var oldest = -1;
+        var oldest_size = 0;
+        var oldest_seq: u64 = 0;
+        var pos = 0;
+        while pos < c.sessions.len {
+            let nl = c.sessions[pos] as i64;
+            let seq = rd_u(c.sessions, pos + 1 + nl, 8);
+            let size = 1 + nl + 8 + 4 + (rd_u(c.sessions, pos + 1 + nl + 8, 4) as! i64);
+            if oldest < 0 || seq < oldest_seq { oldest = pos; oldest_size = size; oldest_seq = seq; }
+            count++;
+            pos += size;
+        }
+        if count < c.opt.tls_sessions { break; }
+        session_remove(c, oldest, oldest_size);
+    }
+    let b = tls::session_bytes(s);
+    c.session_seq++;
+    c.sessions.push(name.len as! u8);
+    c.sessions.append(name);
+    wr_u(c.sessions, c.session_seq as! u64, 8);
+    wr_u(c.sessions, b.len as! u64, 4);
+    c.sessions.append(b);
+}
+
+// What tells one ticket from the next: when it came, and its random age_add.
+fn session_sig(s: const tls::Session&) -> u64 {
+    return ((s.received_ms as! u64) << 32) ^ s.age_add ^ ((s.ticket.len as! u64) << 20) ^ 1;
+}
+
+// A new ticket on connection i (its own TLS, or an https proxy's beneath
+// it when `outer`) goes to the cache.
+fn keep_session(c: Client&, i: i64, outer: bool) {
+    if c.opt.tls_sessions <= 0 { return; }
+    let k = c.conns[i].outer;
+    if outer && k < 0 { return; }
+    var s = tls::no_session();
+    var has = false;
+    if outer { s, has = tls::session(c.outer[k].tc); } else { s, has = tls::session(c.conns[i].tc); }
+    if !has { return; }
+    let g = session_sig(s);
+    var name: u8[>..] = [];
+    if outer {
+        if g == c.outer[k].sess_sig { return; }
+        c.outer[k].sess_sig = g;
+        name.append(c.outer[k].server_name[..]);
+    } else {
+        if g == c.conns[i].sess_sig { return; }
+        c.conns[i].sess_sig = g;
+        name.append(c.conns[i].server_name[..]);
+    }
+    session_put(c, name, s);
+}
+
+// The session to offer `name`, set in c.tlscfg (none if there is none).
+fn offer_session(c: Client&, name: const u8[:]) -> bool {
+    c.tlscfg.session = tls::no_session();
+    if c.opt.tls_sessions <= 0 { return false; }
+    let s, ok = session_get(c, name);
+    if ok { c.tlscfg.session = s; }
+    return ok;
 }
 
 // --- The link beneath a connection's own TLS ----------------------------------
@@ -403,6 +563,7 @@ fn link_read(c: Client&, i: i64, out: u8[>..]&, timeout_op: i64) -> i64 {
         c.raw.clear();
         if c.wire2.len > 0 { httpnet_write(pc.fd, c.wire2, 5000); c.wire2.clear(); }
         if e != 0 { return -ERR_TLS; }
+        keep_session(c, i, true);
         if out.len > before { return 1; }
         if tls::closed(o.tc) { return 0; }
     }
@@ -439,6 +600,7 @@ fn conn_fill(c: Client&, i: i64) -> i64 {
         c.mid.clear();
         if c.wire.len > 0 { link_write_wire(c, i, 5000); }
         if e != 0 { return -ERR_TLS; }
+        keep_session(c, i, false);
         if c.buf.len > before { return 1; }
         if tls::closed(pc.tc) { return 0; }
     }
@@ -459,9 +621,21 @@ fn conn_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     pc.server_name.clear();
     pc.server_name.append(name);
     tls_setup(c, name);
+    pc.sess_sig = 0;
+    let offered = offer_session(c, name);
     pc.tc = tls::client(c.tlscfg);
     c.wire.clear();
     tls::client_start(pc.tc, c.tlscfg, c.wire);
+    let e = conn_handshake_run(c, i, name);
+    c.tlscfg.session = tls::no_session();
+    // A handshake that failed with a session offered drops it (as Go).
+    if e != ERR_NONE && offered { session_drop(c, name); }
+    if e == ERR_NONE { keep_session(c, i, false); }
+    return e;
+}
+
+fn conn_handshake_run(c: Client&, i: i64, name: const u8[:]) -> i64 {
+    let pc: PoolConn& = c.conns[i];
     while !tls::connected(pc.tc) {
         let t = wait_ms(c, c.opt.connect_timeout_ms);
         if t < 0 { return ERR_TIMEOUT; }
@@ -494,11 +668,22 @@ fn outer_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     o.server_name.clear();
     o.server_name.append(name);
     tls_setup(c, name);
-    o.tc = tls::client(c.tlscfg);
-    let fd = c.conns[i].fd;
+    o.sess_sig = 0;
     c.conns[i].outer = k;
+    let offered = offer_session(c, name);
+    o.tc = tls::client(c.tlscfg);
     c.wire2.clear();
     tls::client_start(o.tc, c.tlscfg, c.wire2);
+    let e = outer_handshake_run(c, i, k, name);
+    c.tlscfg.session = tls::no_session();
+    if e != ERR_NONE && offered { session_drop(c, name); }
+    if e == ERR_NONE { keep_session(c, i, true); }
+    return e;
+}
+
+fn outer_handshake_run(c: Client&, i: i64, k: i64, name: const u8[:]) -> i64 {
+    let o: OuterTls& = c.outer[k];
+    let fd = c.conns[i].fd;
     while !tls::connected(o.tc) {
         let t = wait_ms(c, c.opt.connect_timeout_ms);
         if t < 0 { return ERR_TIMEOUT; }
@@ -1000,6 +1185,8 @@ fn read_head(c: Client&, i: i64, u: const Url&) -> Response {
             r.trailer = r.body;
             drop_front(c.buf, ev.used);
             r.conn = i;
+            r.reused = pc.reused;
+            if pc.is_tls { r.tls_version = tls::version(pc.tc); r.tls_resumed = tls::resumed(pc.tc); }
             r.body_done = client_idle(pc.hc) || client_closed(pc.hc);
             if h.status == 101 { r.err = ERR_PROTOCOL; r.status = 0; conn_close(c, i); r.conn = -1; return r; }
             if r.body_done { finish_body(c, r); }
