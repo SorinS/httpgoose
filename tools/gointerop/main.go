@@ -1,6 +1,6 @@
 // gointerop: Go's net/http against this package's tools, on 127.0.0.1.
 //
-//	gointerop server -addr 127.0.0.1:0 [-cert c.pem -key k.pem -tlsmax 1.2|1.3] [-h2]
+//	gointerop server -addr 127.0.0.1:0 [-cert c.pem -key k.pem -tlsmax 1.2|1.3] [-h2 [-h2streams N] [-h2window N]]
 //	gointerop client -base URL [-cacert c.pem -tlsmax 1.2|1.3] [-h2]
 //	gointerop proxy -addr 127.0.0.1:0 [-auth user:pass] [-cert c.pem -key k.pem] [-map host=addr,...]
 //	gointerop socks5 -addr 127.0.0.1:0 [-auth user:pass] [-map host=addr,...]
@@ -112,6 +112,10 @@ func serve(addr, cert, key, tlsmax string) {
 		srv.Protocols.SetHTTP1(true)
 		srv.Protocols.SetHTTP2(true)
 		srv.Protocols.SetUnencryptedHTTP2(true)
+		if h2streams > 0 || h2window > 0 {
+			srv.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: h2streams, MaxReceiveBufferPerStream: h2window,
+				MaxReceiveBufferPerConnection: h2window}
+		}
 	}
 	if cert != "" {
 		protos := []string{"http/1.1"}
@@ -614,6 +618,7 @@ func socksConn(c net.Conn, auth string, m dialMap) {
 }
 
 var h2 bool
+var h2streams, h2window int
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
@@ -634,6 +639,8 @@ func main() {
 	auth := fs.String("auth", "", "proxy credentials, user:pass")
 	maps := fs.String("map", "", "host=addr,... for the proxies")
 	fs.BoolVar(&h2, "h2", false, "HTTP/2: the server offers it, the client uses it")
+	fs.IntVar(&h2streams, "h2streams", 0, "the server's SETTINGS_MAX_CONCURRENT_STREAMS")
+	fs.IntVar(&h2window, "h2window", 0, "the server's receive windows, a stream's and the connection's")
 	fs.Parse(os.Args[2:])
 	switch os.Args[1] {
 	case "server":

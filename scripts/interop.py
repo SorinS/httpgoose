@@ -281,6 +281,86 @@ def goose_client_cases(gh, port, tls, ca, tag):
     check(f"{tag}: a header with CRLF refused", rc == 2)
 
 
+def goose_h2_cases(gh, port, tls, ca, tag, env_base):
+    """goose-http by HTTP/2 against Go's server: over TLS by ALPN, over TCP
+    with prior knowledge."""
+    base = f"https://localhost:{port}" if tls else f"http://127.0.0.1:{port}"
+    opts = ["--cacert", ca, "--tls-max", tls] if tls else ["--http2-prior-knowledge"]
+
+    def gx(*a, data=None):
+        p = subprocess.run([gh, *opts, *a], input=data, capture_output=True, timeout=120, env=env_base)
+        return p.returncode, p.stdout, p.stderr
+    rc, out, err = gx("-i", base + "/hello")
+    check(f"{tag}: GET by HTTP/2", rc == 0 and out.startswith(b"HTTP/2 200\r\n") and out.endswith(b"\r\n\r\nhello"), out[:200] + err[:200])
+    if tls:
+        rc, out, err = gx(base + "/tls")
+        check(f"{tag}: Go saw HTTP/2", rc == 0 and b"proto HTTP/2.0" in out, out[:200])
+    else:
+        rc, out, err = gx("-v", base + "/hello")
+        check(f"{tag}: HTTP/2 without TLS", rc == 0 and b"HTTP/2, stream 1" in err, err[:200])
+    rc, out, err = gx(base + "/big")
+    check(f"{tag}: GET 1 MiB", rc == 0 and out == big())
+    rc, out, err = gx("-T", "-", base + "/echo", data=big())
+    check(f"{tag}: upload 1 MiB of unknown length", rc == 0 and out == big())
+    rc, out, err = gx("-d", "x" * 60000, base + "/echo")
+    check(f"{tag}: POST", rc == 0 and out == b"x" * 60000)
+    rc, out, err = gx(base + "/chunked", base + "/trailer")
+    check(f"{tag}: bodies in pieces, and one with a trailer", rc == 0 and out == b"one two threebody", out[:100])
+    rc, out, err = gx("-I", base + "/big")
+    check(f"{tag}: HEAD", rc == 0 and out.startswith(b"HTTP/2 200\r\n") and out.endswith(b"\r\n\r\n"), out[:200])
+    rc, out, err = gx(base + "/status/404")
+    check(f"{tag}: 404 exits 1", rc == 1)
+    rc, out, err = gx("-v", base + "/hello", base + "/hello", base + "/hello")
+    check(f"{tag}: three requests on one connection, streams 1, 3, 5", rc == 0 and err.count(b"connection reused") == 2 and
+          b"stream 5" in err, err[:400])
+    # The client's policy is the same over HTTP/2.
+    rc, out, err = gx("-L", base + "/chain/3")
+    check(f"{tag}: redirects", rc == 0 and out == b"chain end", out[:100])
+    rc, out, err = gx("-L", "-X", "PUT", "-d", "payload", base + "/redir?status=307&to=/inspect")
+    check(f"{tag}: a 307 sends the body again", rc == 0 and b"body 7 payload" in out, out[:200])
+    rc, out, err = gx("-b", "", "-L", base + "/setcookie?c=a%3D1", base + "/cookies")
+    check(f"{tag}: cookies", rc == 0 and out == b"seta=1", out[:100])
+    rc, out, err = gx("--anyauth", "-u", "alice:secret", base + "/basic")
+    check(f"{tag}: credentials in answer to a 401", rc == 0 and out == b"hello alice", out[:100])
+    rc, out, err = gx("--compressed", base + "/gzip")
+    check(f"{tag}: gzip", rc == 0 and out == big())
+
+
+def nghttpd_cases(gh, tmp, ca, key):
+    """goose-http against nghttpd with tiny flow-control windows (1 KiB a
+    stream, 64 KiB the connection), over TLS and TCP."""
+    if not shutil.which("nghttpd"):
+        check("nghttpd: installed", False, "not on PATH")
+        return
+    docs = os.path.join(tmp, "nghttpd-docs")
+    os.makedirs(docs, exist_ok=True)
+    with open(os.path.join(docs, "big.bin"), "wb") as f:
+        f.write(big())
+    for tls in (True, False):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        cmd = ["nghttpd", "-a", "127.0.0.1", "-d", docs, "-w", "10", "-W", "16", str(port)]
+        cmd += [key, ca] if tls else ["--no-tls"]
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            url = f"https://localhost:{port}/big.bin" if tls else f"http://127.0.0.1:{port}/big.bin"
+            opts = ["--cacert", ca] if tls else ["--http2-prior-knowledge"]
+            rc, out, err = run([gh, *opts, url, url])
+            tag = "tls" if tls else "h2c"
+            check(f"nghttpd {tag}: two GETs of 1 MiB through windows of 1 KiB", rc == 0 and out == big() * 2, err[:300])
+        finally:
+            p.kill()
+            p.wait()
+
+
 DIGEST = r"""
 import hashlib, http.server, re, secrets, sys
 USER, PASSWORD, REALM = "Mufasa", "Circle of Life", "digest@test"
@@ -526,7 +606,7 @@ def fetch_cases(gh, gi, cert, g0, g13, dg, env_base):
     check("timeout: -m 1 against 3 s", rc == 1 and time.time() - t0 < 2.5 and b"timed out" in err, err[:200])
 
 
-def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
+def proxy_cases(gh, gi, cert, g0, g13, env_base, servers, h2port=None):
     go_re = r"listening 127\.0\.0\.1:(\d+)"
     m = ["-map", "origin.test=127.0.0.1"]
     px = Server([gi, "proxy", *m], go_re, "stdout")
@@ -574,6 +654,12 @@ def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
     check("proxy: TLS in TLS, both resumed on the second connection",
           rc == 0 and out == b"version TLS 1.3 resumed false proto HTTP/1.1\nversion TLS 1.3 resumed true proto HTTP/1.1\n"
           and logged(ps, f"proxy CONNECT origin.test:{g13} (resumed)"), out[:200] + err[:200])
+    if h2port:
+        o_h2 = f"https://origin.test:{h2port}/tls"
+        rc, out, err = gx("-x", f"http://127.0.0.1:{px.port}", *tls, o_h2)
+        check("proxy: HTTP/2 inside a CONNECT tunnel", rc == 0 and b"proto HTTP/2.0" in out, out[:200] + err[:200])
+        rc, out, err = gx("-x", f"https://localhost:{ps.port}", *tls, o_h2)
+        check("proxy: HTTP/2 inside TLS inside TLS", rc == 0 and b"proto HTTP/2.0" in out, out[:200] + err[:200])
     rc, out, err = gx("-x", f"socks5h://127.0.0.1:{sx.port}", o_http)
     check("socks5: by name", rc == 0 and out == b"hello" and logged(sx, f"socks CONNECT origin.test:{g0}"), err[:200])
     rc, out, err = gx("-x", f"socks5://127.0.0.1:{sx.port}", *tls, o_https)
@@ -805,6 +891,27 @@ def main():
         goose_client_cases(gh, g0.port, None, cert, "goose-http to go tcp")
         goose_client_cases(gh, g12.port, "1.2", cert, "goose-http to go 1.2")
         goose_client_cases(gh, g13.port, "1.3", cert, "goose-http to go 1.3")
+        env_base = {k: v for k, v in os.environ.items() if k.lower() not in
+                    ("http_proxy", "https_proxy", "no_proxy", "all_proxy", "request_method")}
+        # By HTTP/2: Go's server offering h2 (with a limit of 2 streams and
+        # windows of 70,000 bytes too), goose-httpd, nghttpd.
+        h13 = Server([gi, "server", "-h2", "-cert", cert, "-key", key, "-tlsmax", "1.3"], go_re, "stdout")
+        h12 = Server([gi, "server", "-h2", "-cert", cert, "-key", key, "-tlsmax", "1.2"], go_re, "stdout")
+        hc = Server([gi, "server", "-h2"], go_re, "stdout")
+        ht = Server([gi, "server", "-h2", "-h2streams", "2", "-h2window", "70000", "-cert", cert, "-key", key], go_re, "stdout")
+        servers += [h13, h12, hc, ht]
+        goose_h2_cases(gh, h13.port, "1.3", cert, "goose-http h2 to go 1.3", env_base)
+        goose_h2_cases(gh, h12.port, "1.2", cert, "goose-http h2 to go 1.2", env_base)
+        goose_h2_cases(gh, hc.port, None, cert, "goose-http h2c to go", env_base)
+        goose_h2_cases(gh, ht.port, "1.3", cert, "goose-http h2 to go, 2 streams, small windows", env_base)
+        for tag, url, extra in (("tls", f"https://localhost:{t13.port}", ["--cacert", cert]),
+                                ("h2c", f"http://127.0.0.1:{plain.port}", ["--http2-prior-knowledge"])):
+            rc, out, err = run([gh, *extra, "-v", url + "/big.bin", url + "/big.bin"])
+            check(f"goose-http h2 to goose-httpd {tag}: two GETs of 1 MiB on one connection",
+                  rc == 0 and out == big() * 2 and b"HTTP/2, stream 3" in err, err[:300])
+            rc, out, err = run([gh, *extra, "-X", "POST", "-T", "-", url + "/echo"], data=big())
+            check(f"goose-http h2 to goose-httpd {tag}: POST 1 MiB", rc == 0 and out == big())
+        nghttpd_cases(gh, tmp, cert, key)
         # The client's API with several responses open at once.
         cc = os.path.join(tmp, "clientcheck")
         for tag, url, extra in (("tcp", f"http://127.0.0.1:{g0.port}", []),
@@ -814,17 +921,24 @@ def main():
                 check(f"client api {tag}: " + line.split(" ", 1)[1].split(":")[0], line.startswith("ok "), line)
             if rc not in (0, 1) or not out:
                 check(f"client api {tag}: ran", False, err.decode()[:300])
+        for tag, url, extra in (("h2 tls 1.3", f"https://localhost:{h13.port}", ["--cacert", cert, "--h2"]),
+                                ("h2 tls 1.2", f"https://localhost:{h12.port}", ["--cacert", cert, "--h2"]),
+                                ("h2c", f"http://127.0.0.1:{hc.port}", ["--h2c"]),
+                                ("h2, 2 streams, small windows", f"https://localhost:{ht.port}", ["--cacert", cert, "--h2", "--limit", "2"])):
+            rc, out, err = run([cc, url, *extra], timeout=180)
+            for line in out.decode().splitlines():
+                check(f"client api {tag}: " + line.split(" ", 1)[1].split(":")[0], line.startswith("ok "), line)
+            if rc not in (0, 1) or not out:
+                check(f"client api {tag}: ran", False, err.decode()[:300])
         py = Server([sys.executable, "-c", PY10], r"listening (\d+)", "stdout")
         servers.append(py)
         rc, out, err = run([gh, f"http://127.0.0.1:{py.port}/", f"http://127.0.0.1:{py.port}/"])
         check("goose-http to python HTTP/1.0: bodies to the close, twice", rc == 0 and out == b"to the close " * 2000, err.decode()[:200])
         # goose-http's policy, and proxies. No proxy of the caller's environment.
-        env_base = {k: v for k, v in os.environ.items() if k.lower() not in
-                    ("http_proxy", "https_proxy", "no_proxy", "all_proxy", "request_method")}
         dg = Server([sys.executable, "-c", DIGEST], r"listening (\d+)", "stdout")
         servers.append(dg)
         fetch_cases(gh, gi, cert, g0.port, g13.port, dg.port, env_base)
-        proxy_cases(gh, gi, cert, g0.port, g13.port, env_base, servers)
+        proxy_cases(gh, gi, cert, g0.port, g13.port, env_base, servers, h13.port)
         late = Server([httpd, "--root", www, "--port", "0", "--cert", cert, "--key", key, "--late-ticket"], port_re)
         servers.append(late)
         session_cases(gh, cert, g12.port, g13.port, late.port, env_base)

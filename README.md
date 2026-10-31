@@ -12,7 +12,7 @@ writes byte strings, and the caller owns the sockets.
 | `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt |
 | `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
 | `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
-| `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, several responses open at once and read in any order (each with its connection's input and its own gzip decoder and deadline), bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
+| `http.client` | The I/O: HTTP/2 by ALPN over TLS (Go's DefaultTransport offers it; `opt.http2`), or over TCP with prior knowledge (`opt.h2c`), its connections shared by the requests to one origin, another opened past the server's limit of streams (Go's way), streams refused or past a GOAWAY sent again on a new connection whatever the method (as Go); HTTP/1.1 otherwise; a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, several responses open at once and read in any order (each with its connection's input and its own gzip decoder and deadline), bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
 | `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch`, and `fetch_stream` for a body read as it is sent (started again for a hop that sends it again if it can be, as Go's GetBody; else that hop's response is handed back, as Go does) |
 | `http.hpack` | RFC 7541's header compression: a dynamic table of fixed size (4096 bytes), Huffman coding, a decoder of header blocks that refuses what the RFC has it refuse, and an encoder in Go's way |
 | `http.h2` | RFC 9113 connections, server and client, without I/O: frames, settings, stream states, flow control (windows given back as the application uses the data), header blocks with CONTINUATION taken whole, and §8's rules for messages (pseudo-header fields, connection-specific fields, content-length against the DATA, Host and :authority); a server answers 431 past its header list limit and refuses streams past its limit. Of fixed size (some 27 KB a connection, 256 streams at once). Go's defaults: 250 streams, 1 MiB windows for a server |
@@ -109,7 +109,8 @@ with HTTP/2's preface; `--http1.1` for HTTP/1.1 alone), on
 and POST /echo. Paths are percent-decoded once, refuse `..` segments and
 NUL, and must resolve, symbolic links followed, inside the root.
 `tools/http.goose` (goose-http) is a client on `http.fetch` with curl's
-options: `-L`, `--max-redirs`, `-u` with `--basic`/`--digest`/`--anyauth`,
+options, HTTP/2 over TLS unless `--http1.1`, and over TCP with
+`--http2-prior-knowledge`: `-L`, `--max-redirs`, `-u` with `--basic`/`--digest`/`--anyauth`,
 `--oauth2-bearer`, `-x` (http, https, socks5, socks5h) and `--noproxy`
 (else the proxy environment variables, as curl reads them), `-b`/`-c`
 cookie files, `--compressed`, `-I`, `-i`, `-o`, `-A`, `-e`, `--cacert`,
@@ -131,8 +132,10 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
   streams opened and reset at once) beyond its limit of streams open at
   a time, and no timeout on an unacknowledged SETTINGS; each connection
   is a process of its own.
-
-- HTTP/2.
+- HTTP/2's server push (the client turns it off), priorities (RFC 9113
+  deprecates them), extended CONNECT (RFC 8441, WebSockets over HTTP/2),
+  and the Upgrade from HTTP/1.1 to h2c (RFC 9113 drops it too).
+- HTTP/3.
 - `Client` is a `root struct`, so it can't be returned from a function or
   kept inside another struct.
 
@@ -182,7 +185,16 @@ and TLS 1.3, all on 127.0.0.1: files up to 1 MiB, HEAD, 301, 404, 405,
 bodies of 0 to 1 MiB with lengths and chunked, Expect: 100-continue,
 connection reuse, Connection: close, trailers, bodies to the close, ALPN
 http/1.1, and raw bytes (pipelining, CL with TE, bare LF, a 64 KiB head).
-And by HTTP/2, over TLS 1.3, TLS 1.2 and h2c: curl (1 MiB both ways,
+goose-http by HTTP/2 against Go's server (over TLS 1.3, TLS 1.2 and h2c,
+and with a limit of 2 streams and windows of 70,000 bytes: bodies,
+uploads, trailers, HEAD, three requests on one connection, and the
+client's policy: redirects, a 307's body, cookies, credentials, gzip),
+against goose-httpd, against nghttpd with windows of 1 KiB a stream, and
+inside a CONNECT tunnel and an https proxy's TLS; and the client's API
+(tools/clientcheck.goose) with several responses open at once, over
+HTTP/1.1 and HTTP/2: six streams on one connection read in turns, one
+cancelled, more connections past a server's limit.
+goose-httpd by HTTP/2, over TLS 1.3, TLS 1.2 and h2c: curl (1 MiB both ways,
 HEAD, 20 requests in parallel on one connection), nghttp (10 streams of 1
 MiB at once), h2load (2,000 requests over 4 connections, 25 streams
 each) and Go's client (the same checks, and 40 streams at once).

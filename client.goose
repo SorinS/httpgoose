@@ -26,6 +26,8 @@ import os;
 import http;
 import h1;
 import conn1;
+import hpack;
+import h2;
 import url;
 import cookie;
 import flate;
@@ -95,6 +97,8 @@ struct ClientOptions {
     auth: u8,                       // how the client's credentials are sent: AUTH_*
     tls_sessions: i64,              // TLS sessions kept to resume, one per server name (0: none)
     expect_continue_ms: i64,        // with Expect: 100-continue, how long to wait for the 100 before the body goes (Go's ExpectContinueTimeout; 0: no wait)
+    http2: bool,                    // offer HTTP/2 by ALPN over TLS (Go's ForceAttemptHTTP2 in DefaultTransport)
+    h2c: bool,                      // HTTP/2 over TCP with prior knowledge, for http URLs reached directly
     user_agent: u8[..256],          // sent unless the request has one; empty: none
 }
 
@@ -109,7 +113,8 @@ fn client_options() -> ClientOptions {
     var o = ClientOptions {
         connect_timeout_ms: 30000, read_timeout_ms: 0, timeout_ms: 0, max_idle: 100, max_idle_per_host: 2,
         max_body: 1 << 30, max_redirects: 10, follow_redirects: true, compression: true, insecure: false,
-        cookies: false, auth: AUTH_ANY, tls_sessions: 64, expect_continue_ms: 1000, user_agent: [],
+        cookies: false, auth: AUTH_ANY, tls_sessions: 64, expect_continue_ms: 1000,
+        http2: true, h2c: false, user_agent: [],
     };
     o.user_agent.append("goose-http-client/1.1");
     return o;
@@ -130,6 +135,7 @@ struct PoolConn {
     sess_sig: u64,                  // the TLS session last put in the cache from it
     outer: i64,                     // the TLS to an https proxy beneath its own (c.outer), or -1
     via_proxy: bool,                // requests go to an HTTP proxy in absolute-form
+    h2: i64,                        // its HTTP/2 connection in c.h2s, or -1 for HTTP/1.1
     hc: ClientConn,
     tc: tls::Conn,
 }
@@ -158,6 +164,8 @@ root struct Client {
     wire2: u8[>..] = [],            // the same, through an https proxy's TLS
     deadline: i64 = 0,              // clock_ns() the operation under way must end by, or 0 (its response's)
     gen_seq: i64 = 0,
+    h2s: H2Conn[>..] = [],          // HTTP/2 connections, used by pool slots
+    h2_used: bool[>..] = [],
     inflates: Inflate[>..] = [],    // gzip decoders, one a response that is decoded
     inflate_used: bool[>..] = [],
     jar: Jar = new_jar(),
@@ -173,6 +181,7 @@ root struct Client {
     proxy_authz: u8[>..] = [],      // the Proxy-Authorization value to send, if any
     proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
     proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
+    pend2: u8[>..] = [],            // HTTP/2 frames to send
     pend: u8[>..] = [],             // a request's head and body not sent yet, on connection pend_owner
     pend_owner: i64 = -1,
     sessions: u8[>..] = [],         // the TLS session cache: records of session_put
@@ -192,6 +201,8 @@ struct Response {
     err: i64,                       // ERR_NONE, or what went wrong (no response then)
     status: i64,
     minor: u8,                      // HTTP/1.minor
+    h2: bool,                       // it came by HTTP/2 (on stream `stream`)
+    stream: i64,
     reason: Span,
     url: Span,
     fields: Span,
@@ -217,7 +228,7 @@ struct Response {
 
 fn empty_response(err: i64) -> Response {
     Response {
-        err: err, status: 0, minor: 1, reason: empty_span(), url: empty_span(), fields: empty_span(),
+        err: err, status: 0, minor: 1, h2: false, stream: 0, reason: empty_span(), url: empty_span(), fields: empty_span(),
         trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false,
         tls_version: 0, tls_resumed: false, reused: false,
         sending: false, early: false, length: 0, sent: 0, write_err: 0, deadline: 0, gen: 0, inflate: -1, data: [],
@@ -229,6 +240,8 @@ fn reset_response(r: Response&, err: i64) {
     r.err = err;
     r.status = 0;
     r.minor = 1;
+    r.h2 = false;
+    r.stream = 0;
     r.reason = empty_span();
     r.url = empty_span();
     r.fields = empty_span();
@@ -423,6 +436,16 @@ fn inflate_free(c: Client&, r: Response&) {
 fn conn_close(c: Client&, i: i64) {
     let pc: PoolConn& = c.conns[i];
     if !pc.used { return; }
+    if pc.h2 >= 0 {
+        let k = pc.h2;
+        if !h2_closed(c.h2s[k]) {
+            var out: u8[>..] = [];
+            h2_goaway(c.h2s[k], out);
+            conn_send(c, i, out);
+        }
+        c.h2_used[k] = false;
+        pc.h2 = -1;
+    }
     if pc.is_tls && tls::connected(pc.tc) {
         c.wire.clear();
         tls::close(pc.tc, c.wire);
@@ -450,14 +473,16 @@ fn conn_close(c: Client&, i: i64) {
 
 // Closes every idle connection (Go's CloseIdleConnections).
 fn close_idle(c: Client&) {
-    for i in c.conns.len { if c.conns[i].used && c.conns[i].idle { conn_close(c, i); } }
+    for i in c.conns.len {
+        if c.conns[i].used && c.conns[i].idle && (c.conns[i].h2 < 0 || c.h2s[c.conns[i].h2].active == 0) { conn_close(c, i); }
+    }
 }
 
 fn new_slot(c: Client&) -> i64 {
     for i in c.conns.len { if !c.conns[i].used { return i; } }
     c.conns.push(PoolConn {
         used: false, gen: 0, idle: false, fd: -1, key: [], is_tls: false, reused: false, must_close: false, last_used: 0, server_name: [], sess_sig: 0,
-        outer: -1, via_proxy: false, hc: client_conn(), tc: tls::client(c.tlscfg),
+        outer: -1, via_proxy: false, h2: -1, hc: client_conn(), tc: tls::client(c.tlscfg),
     });
     return c.conns.len - 1;
 }
@@ -473,7 +498,7 @@ fn take_idle(c: Client&, key: const u8[:]) -> i64 {
     var best = -1;
     for i in c.conns.len {
         let pc: PoolConn& = c.conns[i];
-        if !pc.used || !pc.idle || pc.key[..] != key { continue; }
+        if !pc.used || !pc.idle || pc.key[..] != key || pc.h2 >= 0 { continue; }
         // Something came while it was idle: its end, or bytes no request
         // asked for, and then it cannot carry a request; or, on TLS, only
         // handshake messages (a late NewSessionTicket, a KeyUpdate), read
@@ -517,6 +542,16 @@ fn idle_drain(c: Client&, i: i64) -> bool {
 fn conn_release(c: Client&, i: i64) {
     let pc: PoolConn& = c.conns[i];
     if !pc.used { return; }
+    if pc.h2 >= 0 {
+        // Shared: idle (for the limits) when no stream is open; closed when
+        // it can take no more.
+        let h: H2Conn& = c.h2s[pc.h2];
+        if h.active > 0 { return; }
+        if h2_closed(h) || h.goaway_got || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 { conn_close(c, i); return; }
+        pc.idle = true;
+        pc.last_used = clock_ns();
+        return;
+    }
     if !client_idle(pc.hc) || pc.must_close || leftover(c, i) > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
         conn_close(c, i);
         return;
@@ -763,11 +798,13 @@ fn conn_fill_t(c: Client&, i: i64, timeout_op: i64) -> i64 {
     return 0;
 }
 
-fn tls_setup(c: Client&, name: const u8[:]) {
+fn tls_setup(c: Client&, name: const u8[:], h2_ok: bool) {
     c.tlscfg.server_name.clear();
     c.tlscfg.server_name.append(name);
     c.tlscfg.verify = !c.opt.insecure;
-    if c.tlscfg.alpn.len == 0 { tls::add_alpn(c.tlscfg.alpn, "http/1.1"); }
+    c.tlscfg.alpn.clear();
+    if h2_ok && c.opt.http2 { tls::add_alpn(c.tlscfg.alpn, "h2"); }
+    tls::add_alpn(c.tlscfg.alpn, "http/1.1");
 }
 
 // The connection's own TLS handshake for `name`, over its link.
@@ -776,7 +813,7 @@ fn conn_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     pc.is_tls = true;
     pc.server_name.clear();
     pc.server_name.append(name);
-    tls_setup(c, name);
+    tls_setup(c, name, true);
     pc.sess_sig = 0;
     let offered = offer_session(c, name);
     pc.tc = tls::client(c.tlscfg);
@@ -824,7 +861,7 @@ fn outer_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     let o: OuterTls& = c.outer[k];
     o.server_name.clear();
     o.server_name.append(name);
-    tls_setup(c, name);
+    tls_setup(c, name, false);
     o.sess_sig = 0;
     c.conns[i].outer = k;
     let offered = offer_session(c, name);
@@ -887,6 +924,7 @@ fn conn_dial(c: Client&, i: i64, host: const u8[:], port: i64) -> i64 {
     pc.must_close = false;
     pc.outer = -1;
     pc.via_proxy = false;
+    pc.h2 = -1;
     pc.hc = client_conn();
     return ERR_NONE;
 }
@@ -1147,6 +1185,16 @@ fn conn_for(c: Client&, u: const Url&, fresh: bool) -> i64 {
     else if !origin_key(u, key) { return -ERR_URL; }
     if key.len > 600 { return -ERR_URL; }
     if !fresh {
+        // An HTTP/2 connection to the origin that can take another stream
+        // (another is opened when it cannot, as Go does).
+        for j in c.conns.len {
+            let q: PoolConn& = c.conns[j];
+            if q.used && q.h2 >= 0 && q.key[..] == key && h2_can_open(c.h2s[q.h2]) {
+                q.reused = q.reused || q.idle || c.h2s[q.h2].next_id > 1;
+                q.idle = false;
+                return j;
+            }
+        }
         let i = take_idle(c, key);
         if i >= 0 { return i; }
     }
@@ -1186,6 +1234,27 @@ fn conn_for(c: Client&, u: const Url&, fresh: bool) -> i64 {
     if url_https(u) {
         let he = conn_handshake(c, i, host);
         if he != ERR_NONE { conn_close(c, i); return -he; }
+        if c.conns[i].tc.alpn[..] == "h2" { h2_open(c, i); }
+    } else if c.opt.h2c && ptext.len == 0 {
+        h2_open(c, i);
+    }
+    if c.conns[i].h2 >= 0 {
+        let se = conn_send(c, i, c.pend2);
+        c.pend2.clear();
+        if se != ERR_NONE { conn_close(c, i); return -se; }
+        // The server's SETTINGS (its first frame, on its way already): its
+        // limit of streams is known before any is opened.
+        let saved = c.opt.read_timeout_ms;
+        c.opt.read_timeout_ms = c.opt.connect_timeout_ms;
+        while c.h2s[c.conns[i].h2].state != C2_OPEN {
+            let n = h2_pump(c, i);
+            if n <= 0 {
+                c.opt.read_timeout_ms = saved;
+                conn_close(c, i);
+                return -(if n == 0 { ERR_PROTOCOL } else { -n });
+            }
+        }
+        c.opt.read_timeout_ms = saved;
     }
     return i;
 }
@@ -1198,6 +1267,338 @@ fn host_port_text(u: const Url&, out: u8[>..]&) {
     if u.ipv6 { out.push(']'); }
     out.push(':');
     format(out, url_port(u));
+}
+
+// --- HTTP/2 ----------------------------------------------------------------
+
+// What came on an HTTP/2 connection for each stream waits in c.store until
+// its response asks for it: the head (u16 status, then the fields as
+// lines), body data, the trailer, the end, a reset (u32 code, u8 1 if the
+// request was never processed: it may go again), a 100.
+let K_HEAD: u8 = 2;
+let K_BODY: u8 = 3;
+let K_END: u8 = 4;
+let K_RESET: u8 = 5;
+let K_TRAILER: u8 = 6;
+let K_CONT: u8 = 7;
+
+// Slot i speaks HTTP/2 from now: its connection's preface and SETTINGS
+// wait in c.pend2. Go's client windows: 4 MiB a stream, 1 GiB the
+// connection (so a stream read late never holds up the others).
+fn h2_open(c: Client&, i: i64) {
+    var k = -1;
+    for j in c.h2_used.len { if !c.h2_used[j] { k = j; break; } }
+    var opt = h2_client_options();
+    opt.conn_window = 1 << 30;
+    if k < 0 {
+        c.h2s.push(h2_conn(opt));
+        c.h2_used.push(true);
+        k = c.h2s.len - 1;
+    } else {
+        c.h2s[k] = h2_conn(opt);
+        c.h2_used[k] = true;
+    }
+    c.conns[i].h2 = k;
+    c.pend2.clear();
+    h2_start(c.h2s[k], c.pend2);
+}
+
+fn store_has(c: const Client&, slot: i64, stream: i64, kind: u8) -> bool {
+    let p, n = store_find(c, slot, stream, kind);
+    return p >= 0;
+}
+
+// Drops a stream's records.
+fn store_drop_stream(c: Client&, slot: i64, stream: i64) {
+    var p = 0;
+    while p + 13 <= c.store.len {
+        let n = rd_u(c.store, p + 9, 4) as! i64;
+        if (rd_u(c.store, p, 4) as! i64) == slot && (rd_u(c.store, p + 4, 4) as! i64) == stream { store_cut(c, p, 13 + n); }
+        else { p += 13 + n; }
+    }
+}
+
+// Reads what came on HTTP/2 connection i (waiting up to the read timeout
+// if nothing is there to read yet) and files every event under its
+// stream: 1, 0 if the connection ended, or -ERR_*.
+fn h2_pump(c: Client&, i: i64) -> i64 {
+    let k = c.conns[i].h2;
+    var out: u8[>..] = [];
+    var fields: u8[>..] = [];
+    var body: u8[>..] = [];
+    var rec: u8[>..] = [];
+    var any = false;
+    var rounds = 0;
+    while rounds < 2 {
+        use_buf(c, i);
+        while true {
+            body.clear();
+            let ev = h2_read(c.h2s[k], c.buf, fields, body, out);
+            drop_front(c.buf, ev.used);
+            if ev.kind == EV2_NEED_MORE { break; }
+            any = true;
+            let sid = ev.stream;
+            if ev.kind == EV2_HEADERS {
+                if ev.interim {
+                    if ev.status == 100 { store_put(c, i, sid, K_CONT, "1"); }
+                } else {
+                    rec.clear();
+                    // The fields without the pseudo-header ones.
+                    var lines: u8[>..] = [];
+                    each_split(fields, '\n') {
+                        let l = trim_cr(it);
+                        if l.len > 0 && l[0] != ':' { lines.append(l); lines.append("\r\n"); }
+                    };
+                    if ev.trailers {
+                        store_put(c, i, sid, K_TRAILER, lines);
+                    } else {
+                        wr_u(rec, ev.status as! u64, 2);
+                        rec.append(lines);
+                        store_put(c, i, sid, K_HEAD, rec);
+                    }
+                }
+                if ev.end_stream { store_put(c, i, sid, K_END, "1"); }
+            } else if ev.kind == EV2_DATA {
+                store_put(c, i, sid, K_BODY, body);
+                if ev.end_stream { store_put(c, i, sid, K_END, "1"); }
+            } else if ev.kind == EV2_RESET {
+                rec.clear();
+                wr_u(rec, ev.code as! u64, 4);
+                // REFUSED_STREAM: the request was not processed (§8.7).
+                rec.push(if ev.code == E2_REFUSED_STREAM && !store_has(c, i, sid, K_HEAD) { 1 } else { 0 });
+                store_put(c, i, sid, K_RESET, rec);
+            } else if ev.kind == EV2_GOAWAY {
+                // Streams above the last one were not processed: they may
+                // go again on another connection (§6.8).
+                for s in H2_MAX_STREAMS {
+                    let id = c.h2s[k].streams[s].id;
+                    if id > ev.last_stream && !store_has(c, i, id, K_RESET) {
+                        rec.clear();
+                        wr_u(rec, ev.code as! u64, 4);
+                        rec.push(1);
+                        store_put(c, i, id, K_RESET, rec);
+                    }
+                }
+            } else if ev.kind == EV2_ERROR {
+                if out.len > 0 { conn_send(c, i, out); }
+                return -ERR_PROTOCOL;
+            }
+        }
+        if out.len > 0 {
+            let se = conn_send(c, i, out);
+            out.clear();
+            if se != ERR_NONE { return -se; }
+        }
+        if any { return 1; }
+        let n = conn_fill(c, i);
+        if n <= 0 { return n; }
+        rounds++;
+    }
+    return 1;
+}
+
+// A connection that failed fails every stream on it.
+fn h2_conn_failed(c: Client&, i: i64) -> bool {
+    return !c.conns[i].used || c.conns[i].h2 < 0 || h2_closed(c.h2s[c.conns[i].h2]);
+}
+
+// The request's head on stream: HEADERS at once (DATA follows as the
+// body is written).
+fn h2_begin(c: Client&, r: Response&, i: i64, method: const u8[:], u: const Url&, host: const u8[:], f: const u8[:],
+            length: i64, expect: bool) {
+    let k = c.conns[i].h2;
+    var path: u8[>..] = [];
+    request_target(u, path);
+    var fields: u8[>..] = [];
+    fields.append(f);
+    // Content-Length as HTTP/1.1 sends it; none for a body of unknown length.
+    if length > 0 || (length == 0 && (method == "POST" || method == "PUT" || method == "PATCH")) {
+        add_content_length(fields, length);
+    }
+    var out: u8[>..] = [];
+    let sid = h2_request(c.h2s[k], method, url_scheme(u), host, path, fields, length == 0, out);
+    if sid < 0 { r.err = ERR_PROTOCOL; return; }
+    r.h2 = true;
+    r.stream = sid;
+    r.conn = i;
+    r.sending = true;               // until end_request, which reads the head
+    r.body_done = false;
+    r.length = length;
+    let se = conn_send(c, i, out);
+    if se != ERR_NONE { r.err = se; r.status = -1; r.sending = false; conn_close(c, i); r.conn = -1; return; }
+    if expect && length != 0 && c.opt.expect_continue_ms > 0 { h2_wait_continue(c, r); }
+}
+
+// Expect: 100-continue on HTTP/2: the 100, a final response (the body is
+// not sent then), or the wait ends.
+fn h2_wait_continue(c: Client&, r: Response&) {
+    let i = r.conn;
+    let end = clock_ns() + c.opt.expect_continue_ms * 1000000;
+    let saved = c.opt.read_timeout_ms;
+    while true {
+        if store_has(c, i, r.stream, K_CONT) || store_has(c, i, r.stream, K_RESET) { return; }
+        if store_has(c, i, r.stream, K_HEAD) { r.early = true; return; }
+        let left = (end - clock_ns()) / 1000000;
+        if left <= 0 { return; }
+        c.opt.read_timeout_ms = left;
+        let n = h2_pump(c, i);
+        c.opt.read_timeout_ms = saved;
+        if n == -ERR_TIMEOUT { return; }
+        if n <= 0 { r.early = true; return; }
+    }
+}
+
+// The body's bytes as DATA, as the windows allow; the response is read
+// meanwhile, so one that comes first (a 413) is not held up.
+fn h2_send_body(c: Client&, r: Response&, data: const u8[:], last: bool, trailer: const u8[:]) {
+    let i = r.conn;
+    let k = c.conns[i].h2;
+    var at = 0;
+    var out: u8[>..] = [];
+    while true {
+        if h2_conn_failed(c, i) { r.write_err = ERR_IO; return; }
+        if store_has(c, i, r.stream, K_RESET) { r.write_err = ERR_IO; return; }
+        // The response came whole: nothing more is needed of the body.
+        if store_has(c, i, r.stream, K_END) && store_has(c, i, r.stream, K_HEAD) { r.early = true; return; }
+        let end_now = last && trailer.len == 0;
+        out.clear();
+        let n = h2_data(c.h2s[k], r.stream, data[at..], end_now, out);
+        if n < 0 { r.write_err = ERR_IO; return; }
+        at += n;
+        r.sent += n;
+        if out.len > 0 {
+            let se = conn_send(c, i, out);
+            if se != ERR_NONE { r.write_err = se; return; }
+        }
+        if at >= data.len {
+            if last && trailer.len > 0 {
+                out.clear();
+                h2_trailers(c.h2s[k], r.stream, trailer, out);
+                let se = conn_send(c, i, out);
+                if se != ERR_NONE { r.write_err = se; }
+            }
+            return;
+        }
+        // No window: read until there is some.
+        let p = h2_pump(c, i);
+        if p <= 0 { r.write_err = if p == 0 { ERR_IO } else { -p }; return; }
+    }
+}
+
+// The response's head on stream r.stream, into r.
+fn h2_read_head(c: Client&, i: i64, r: Response&) {
+    let sid = r.stream;
+    let url_t = copy_url_text(r);
+    reset_response(r, ERR_NONE);
+    set_url(r, url_t);
+    r.h2 = true;
+    r.stream = sid;
+    r.minor = 0;
+    while true {
+        let p, n = store_find(c, i, sid, K_HEAD);
+        if p >= 0 {
+            var rec: u8[>..] = [];
+            store_take(c, i, sid, K_HEAD, rec);
+            r.status = rd_u(rec, 0, 2) as! i64;
+            r.reason = span(r.data.len, r.data.len);
+            let fp = r.data.len;
+            r.data.append(rec[2..]);
+            r.fields = span(fp, r.data.len);
+            r.body = span(r.data.len, r.data.len);
+            r.trailer = r.body;
+            r.conn = i;
+            r.gen = c.conns[i].gen;
+            r.body_done = false;
+            if store_has(c, i, sid, K_END) && !store_has(c, i, sid, K_BODY) { h2_finish_stream(c, r); }
+            if c.conns[i].is_tls { r.tls_version = tls::version(c.conns[i].tc); r.tls_resumed = tls::resumed(c.conns[i].tc); }
+            return;
+        }
+        let rp, rn = store_find(c, i, sid, K_RESET);
+        if rp >= 0 {
+            // Never processed: status -2, so the request may go again.
+            let unprocessed = c.store[rp + 13 + 4] == 1;
+            r.err = ERR_IO;
+            r.status = if unprocessed { -2 } else { 0 };
+            store_drop_stream(c, i, sid);
+            conn_release(c, i);
+            return;
+        }
+        if h2_conn_failed(c, i) { r.err = ERR_IO; r.status = 0; return; }
+        let e = h2_pump(c, i);
+        if e <= 0 {
+            r.err = if e == 0 { ERR_IO } else { -e };
+            conn_close(c, i);
+            return;
+        }
+    }
+}
+
+// The stream is done: its trailer to the response, and the connection
+// back to being shared (or idle).
+fn h2_finish_stream(c: Client&, r: Response&) {
+    let i = r.conn;
+    if i >= 0 {
+        var t: u8[>..] = [];
+        store_take(c, i, r.stream, K_TRAILER, t);
+        if t.len > 0 {
+            let tp = r.data.len;
+            r.data.append(t);
+            r.trailer = span(tp, r.data.len);
+        }
+        store_drop_stream(c, i, r.stream);
+        r.conn = -1;
+        conn_release(c, i);
+    }
+    r.body_done = true;
+}
+
+// More of the body of a stream: bytes appended, 0 at its end, or -ERR_*.
+fn h2_read_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
+    let i = r.conn;
+    while true {
+        let p, n = store_find(c, i, r.stream, K_BODY);
+        if p >= 0 {
+            let before = out.len;
+            store_take(c, i, r.stream, K_BODY, out);
+            // The windows open again as the application takes the data.
+            var wu: u8[>..] = [];
+            h2_consumed(c.h2s[c.conns[i].h2], r.stream, out.len - before, wu);
+            if wu.len > 0 { conn_send(c, i, wu); }
+            if store_has(c, i, r.stream, K_END) && !store_has(c, i, r.stream, K_BODY) { h2_finish_stream(c, r); }
+            return out.len - before;
+        }
+        if store_has(c, i, r.stream, K_END) { h2_finish_stream(c, r); return 0; }
+        if store_has(c, i, r.stream, K_RESET) {
+            store_drop_stream(c, i, r.stream);
+            r.conn = -1;
+            r.body_done = true;
+            conn_release(c, i);
+            return -ERR_IO;
+        }
+        if h2_conn_failed(c, i) { r.conn = -1; r.body_done = true; return -ERR_IO; }
+        let e = h2_pump(c, i);
+        if e <= 0 {
+            conn_close(c, i);
+            r.conn = -1;
+            r.body_done = true;
+            return if e == 0 { -ERR_IO } else { e };
+        }
+    }
+    return 0;
+}
+
+// Stops reading a stream's body: RST_STREAM CANCEL, the rest dropped.
+fn h2_close_body(c: Client&, r: Response&) {
+    let i = r.conn;
+    if !h2_conn_failed(c, i) && h2_stream_open(c.h2s[c.conns[i].h2], r.stream) {
+        var out: u8[>..] = [];
+        h2_reset(c.h2s[c.conns[i].h2], r.stream, E2_CANCEL, out);
+        conn_send(c, i, out);
+    }
+    store_drop_stream(c, i, r.stream);
+    r.conn = -1;
+    r.body_done = true;
+    conn_release(c, i);
 }
 
 // --- Requests --------------------------------------------------------------
@@ -1264,8 +1665,11 @@ fn round_trip(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:
             finish_request(c, r);
             if r.err == ERR_NONE { return r; }
         }
-        // Nothing of a response came on a reused connection.
+        // Nothing of a response came on a reused connection; or HTTP/2 said
+        // the request was not processed (REFUSED_STREAM, past a GOAWAY's
+        // last stream), which Go sends again whatever the method.
         if r.reused && attempt == 1 && r.status == -1 && r.err == ERR_IO && replayable(method, fields) { continue; }
+        if r.status == -2 && attempt < 3 { continue; }
         if r.status < 0 { r.status = 0; }
         return r;
     }
@@ -1361,6 +1765,14 @@ fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:],
     if i < 0 { r.err = -i; return r; }
     r.reused = c.conns[i].reused;
     r.gen = c.conns[i].gen;
+    if c.conns[i].h2 >= 0 {
+        var hf = fields_without(fields, "Host");
+        if c.conns[i].via_proxy && c.proxy_authz.len > 0 { add_field(hf, "Proxy-Authorization", c.proxy_authz); }
+        let ex, has_ex = field_value(fields, "Expect");
+        h2_begin(c, r, i, method, u, host, hf, length, has_ex && eq_fold(ex, "100-continue"));
+        c.conns[i].reused = true;
+        return r;
+    }
     use_buf(c, i);
     c.buf.clear();
     c.mid.clear();
@@ -1408,6 +1820,11 @@ fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:],
 // body is chunked, and with `last` the end: the last chunk and trailer.
 fn send_body(c: Client&, r: Response&, data: const u8[:], last: bool, trailer: const u8[:]) {
     let i = r.conn;
+    if r.h2 {
+        if !r.sending || r.length == 0 || r.early || r.write_err != ERR_NONE { return; }
+        h2_send_body(c, r, data, last, trailer);
+        return;
+    }
     if c.pend_owner != i { flush_pend(c); c.pend_owner = i; }
     if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
     // A response that has come already ends the sending.
@@ -1505,6 +1922,16 @@ fn finish_request(c: Client&, r: Response&) {
     let i = r.conn;
     r.sending = false;
     if i < 0 { return; }
+    if r.h2 {
+        let deadline = r.deadline;
+        let reused = r.reused;
+        let werr = r.write_err;
+        h2_read_head(c, i, r);
+        r.deadline = deadline;
+        r.reused = reused;
+        if r.err != ERR_NONE && werr != ERR_NONE && r.status != -2 { r.err = werr; }
+        return;
+    }
     let incomplete = r.early || r.write_err != ERR_NONE;
     if incomplete { c.conns[i].must_close = true; }
     let werr = r.write_err;
@@ -1610,6 +2037,7 @@ fn read_wire_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
     // Its connection is gone (closed under it, the slot used again).
     if !c.conns[i].used || c.conns[i].gen != r.gen { r.conn = -1; r.body_done = true; return -ERR_IO; }
     c.deadline = r.deadline;
+    if r.h2 { return h2_read_body(c, r, out); }
     var trailer: u8[>..] = [];
     var eof = false;
     while true {
@@ -1710,6 +2138,7 @@ fn close_body(c: Client&, r: Response&) {
     inflate_free(c, r);
     if r.body_done || r.conn < 0 { r.body_done = true; return; }
     if !c.conns[r.conn].used || c.conns[r.conn].gen != r.gen { r.conn = -1; r.body_done = true; return; }
+    if r.h2 { h2_close_body(c, r); return; }
     var sink: u8[>..] = [];
     var rounds = 0;
     while !r.body_done && sink.len <= 2048 && rounds < 4 {

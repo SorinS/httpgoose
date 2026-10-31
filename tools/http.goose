@@ -26,6 +26,8 @@
 //   --compressed        ask for gzip and decode it
 //   --cacert FILE       trust these roots (PEM), not the system's; -k checks nothing
 //   --tls-max 1.2|1.3   the highest TLS version
+//   --http1.1           HTTP/1.1 only (HTTP/2 is offered over TLS by default);
+//   --http2-prior-knowledge   HTTP/2 over TCP too, without asking
 //   --connect-timeout S, -m S   seconds to connect, for the whole of each request
 //   --rate N/s|N/m|N/h  start at most N requests a second, minute or hour
 //   -s                  print no errors; -v: say what happens on stderr
@@ -206,6 +208,9 @@ fn main() {
         else if s == "--noproxy" && has_next { no_proxy.clear(); no_proxy.append(next); i += 2; }
         else if s == "-b" && has_next { cookie_in.clear(); cookie_in.append(next); cookies_on = true; i += 2; }
         else if s == "-c" && has_next { cookie_out.clear(); cookie_out.append(next); cookies_on = true; i += 2; }
+        else if s == "--http1.1" { c.opt.http2 = false; i++; }
+        else if s == "--http2" { c.opt.http2 = true; i++; }
+        else if s == "--http2-prior-knowledge" { c.opt.h2c = true; i++; }
         else if s == "--compressed" { c.opt.compression = true; i++; }
         else if s == "--cacert" && has_next { cacert.clear(); cacert.append(next); i += 2; }
         else if s == "-k" || s == "--insecure" { c.opt.insecure = true; i++; }
@@ -276,16 +281,22 @@ fn main() {
                 status = 1;
             } else {
                 note("from ", http::response_url(r));
+                if r.h2 { note("HTTP/2, stream ", str(r.stream)); }
                 note(if r.reused { "connection reused" } else { "new connection" },
                      if r.tls_version == tls::VERSION_TLS13 { ", TLS 1.3" } else if r.tls_version == tls::VERSION_TLS12 { ", TLS 1.2" } else { "" });
                 if r.tls_resumed { note("TLS session resumed", ""); }
                 if include {
-                    out.append("HTTP/1.");
-                    format(out, r.minor);
-                    out.push(' ');
-                    format(out, r.status);
-                    out.push(' ');
-                    out.append(http::response_reason(r));
+                    if r.h2 {
+                        out.append("HTTP/2 ");
+                        format(out, r.status);
+                    } else {
+                        out.append("HTTP/1.");
+                        format(out, r.minor);
+                        out.push(' ');
+                        format(out, r.status);
+                        out.push(' ');
+                        out.append(http::response_reason(r));
+                    }
                     out.append("\r\n");
                     out.append(http::response_fields(r));
                     out.append("\r\n");
