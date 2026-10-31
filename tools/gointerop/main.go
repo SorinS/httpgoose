@@ -1,7 +1,7 @@
 // gointerop: Go's net/http against this package's tools, on 127.0.0.1.
 //
-//	gointerop server -addr 127.0.0.1:0 [-cert c.pem -key k.pem -tlsmax 1.2|1.3]
-//	gointerop client -base URL [-cacert c.pem -tlsmax 1.2|1.3]
+//	gointerop server -addr 127.0.0.1:0 [-cert c.pem -key k.pem -tlsmax 1.2|1.3] [-h2]
+//	gointerop client -base URL [-cacert c.pem -tlsmax 1.2|1.3] [-h2]
 //	gointerop proxy -addr 127.0.0.1:0 [-auth user:pass] [-cert c.pem -key k.pem] [-map host=addr,...]
 //	gointerop socks5 -addr 127.0.0.1:0 [-auth user:pass] [-map host=addr,...]
 //
@@ -106,8 +106,19 @@ func serve(addr, cert, key, tlsmax string) {
 	fmt.Println("listening", ln.Addr().String())
 	os.Stdout.Sync()
 	srv := &http.Server{Handler: mux}
+	if h2 {
+		// HTTP/2 by ALPN over TLS, and with prior knowledge over TCP.
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		srv.Protocols.SetHTTP2(true)
+		srv.Protocols.SetUnencryptedHTTP2(true)
+	}
 	if cert != "" {
-		srv.TLSConfig = &tls.Config{MaxVersion: tlsVersion(tlsmax), NextProtos: []string{"http/1.1"}}
+		protos := []string{"http/1.1"}
+		if h2 {
+			protos = []string{"h2", "http/1.1"}
+		}
+		srv.TLSConfig = &tls.Config{MaxVersion: tlsVersion(tlsmax), NextProtos: protos}
 		err = srv.ServeTLS(ln, cert, key)
 	} else {
 		err = srv.Serve(ln)
@@ -128,7 +139,17 @@ func (c *checker) check(name string, err error) {
 }
 
 func client(base, cacert, tlsmax string) {
-	tr := &http.Transport{ForceAttemptHTTP2: false}
+	tr := &http.Transport{ForceAttemptHTTP2: h2}
+	proto := "http/1.1"
+	if h2 {
+		proto = "h2"
+		tr.Protocols = new(http.Protocols)
+		if cacert != "" {
+			tr.Protocols.SetHTTP2(true)
+		} else {
+			tr.Protocols.SetUnencryptedHTTP2(true)
+		}
+	}
 	if cacert != "" {
 		pem, err := os.ReadFile(cacert)
 		if err != nil {
@@ -138,7 +159,7 @@ func client(base, cacert, tlsmax string) {
 		pool := x509.NewCertPool()
 		pool.AppendCertsFromPEM(pem)
 		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tlsVersion(tlsmax), MaxVersion: tlsVersion(tlsmax),
-			NextProtos: []string{"http/1.1"}}
+			NextProtos: []string{proto}}
 	}
 	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var c checker
@@ -236,11 +257,55 @@ func client(base, cacert, tlsmax string) {
 		if err == nil {
 			io.ReadAll(r.Body)
 			r.Body.Close()
-			if r.TLS == nil || r.TLS.Version != tlsVersion(tlsmax) || r.TLS.NegotiatedProtocol != "http/1.1" {
+			if r.TLS == nil || r.TLS.Version != tlsVersion(tlsmax) || r.TLS.NegotiatedProtocol != proto {
 				err = fmt.Errorf("TLS %x, ALPN %q", r.TLS.Version, r.TLS.NegotiatedProtocol)
 			}
 		}
-		c.check("TLS "+tlsmax+" with ALPN http/1.1", err)
+		c.check("TLS "+tlsmax+" with ALPN "+proto, err)
+	}
+	if h2 {
+		// Every response by HTTP/2, and 40 at once on one connection.
+		r, err := hc.Get(base + "/index.html")
+		if err == nil {
+			io.ReadAll(r.Body)
+			r.Body.Close()
+			if r.ProtoMajor != 2 {
+				err = fmt.Errorf("%s", r.Proto)
+			}
+		}
+		c.check("HTTP/2", err)
+		var wg sync.WaitGroup
+		errs := make(chan error, 40)
+		for i := 0; i < 40; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				var r *http.Response
+				var b []byte
+				var err error
+				if i%2 == 0 {
+					r, b, err = get("/big.bin")
+					errs <- expect(r, b, err, 200, big())
+				} else {
+					body := big()[:i*997]
+					pr, perr := hc.Post(base+"/echo", "application/octet-stream", bytes.NewReader(body))
+					if perr == nil {
+						b, perr = io.ReadAll(pr.Body)
+						pr.Body.Close()
+					}
+					errs <- expect(pr, b, perr, 200, body)
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		var first error
+		for e := range errs {
+			if e != nil && first == nil {
+				first = e
+			}
+		}
+		c.check("40 streams at once, GETs of 1 MiB and POSTs", first)
 	}
 	if c.failed {
 		os.Exit(1)
@@ -548,6 +613,8 @@ func socksConn(c net.Conn, auth string, m dialMap) {
 	io.Copy(c, up)
 }
 
+var h2 bool
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		fmt.Println(version)
@@ -566,6 +633,7 @@ func main() {
 	cacert := fs.String("cacert", "", "roots for the server's certificate (PEM)")
 	auth := fs.String("auth", "", "proxy credentials, user:pass")
 	maps := fs.String("map", "", "host=addr,... for the proxies")
+	fs.BoolVar(&h2, "h2", false, "HTTP/2: the server offers it, the client uses it")
 	fs.Parse(os.Args[2:])
 	switch os.Args[1] {
 	case "server":

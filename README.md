@@ -1,6 +1,6 @@
 # httpgoose
 
-HTTP for Goose: HTTP/1.1 now, HTTP/2 to follow, with HTTPS through
+HTTP for Goose: HTTP/1.1 and HTTP/2, with HTTPS through
 [tlsgoose](../tlsgoose.git). The protocol code does no I/O: it parses and
 writes byte strings, and the caller owns the sockets.
 
@@ -14,6 +14,8 @@ writes byte strings, and the caller owns the sockets.
 | `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
 | `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
 | `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch`, and `fetch_stream` for a body read as it is sent (started again for a hop that sends it again if it can be, as Go's GetBody; else that hop's response is handed back, as Go does) |
+| `http.hpack` | RFC 7541's header compression: a dynamic table of fixed size (4096 bytes), Huffman coding, a decoder of header blocks that refuses what the RFC has it refuse, and an encoder in Go's way |
+| `http.h2` | RFC 9113 connections, server and client, without I/O: frames, settings, stream states, flow control (windows given back as the application uses the data), header blocks with CONTINUATION taken whole, and §8's rules for messages (pseudo-header fields, connection-specific fields, content-length against the DATA, Host and :authority); a server answers 431 past its header list limit and refuses streams past its limit. Of fixed size (some 27 KB a connection, 256 streams at once). Go's defaults: 250 streams, 1 MiB windows for a server |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
@@ -99,8 +101,10 @@ parsers and the other modules need none of it, and no C.
 
 ## Tools
 
-`tools/httpd.goose` (goose-httpd) serves static files over HTTP/1.1, plain
-or HTTPS through tlsgoose (`--tls-max 1.2` holds it to TLS 1.2), on
+`tools/httpd.goose` (goose-httpd) serves static files over HTTP/1.1 and
+HTTP/2, plain or HTTPS through tlsgoose (TLS 1.3 unless `--tls-max 1.2`
+holds it to TLS 1.2; HTTP/2 by ALPN, or on TCP to a client that starts
+with HTTP/2's preface; `--http1.1` for HTTP/1.1 alone), on
 127.0.0.1 unless told otherwise, one process a connection; GET and HEAD,
 and POST /echo. Paths are percent-decoded once, refuse `..` segments and
 NUL, and must resolve, symbolic links followed, inside the root.
@@ -138,7 +142,26 @@ python3 scripts/flate_differential.py [--seed N] [--count N] [-v]
 python3 scripts/httpnet_check.py [--cc CC | --msvc]   # src/httpnet.c alone, also on Windows
 python3 scripts/gen_cookie_vectors.py      # Go's cookiejar tables -> test/vectors/cookiejar*.txt
 python3 scripts/gen_proxy_vectors.py       # x/net's httpproxy tables -> test/vectors/proxy.txt
+python3 scripts/hpack_differential.py [--seed N] [--conns N] [-v]
+python3 scripts/h2spec.py [-v]             # h2spec against goose-httpd, TLS and h2c
+python3 scripts/gen_hpack_tables.py        # x/net's hpack tables -> hpacktab.goose
+python3 scripts/gen_hpack_vectors.py       # RFC 7541 Appendix C -> test/vectors/hpack_rfc.txt
 ```
+
+`hpack_differential.py` has golang.org/x/net/http2/hpack make
+connections of header blocks from random header lists, with changes of
+the table size, some blocks changed at random; both decoders read each
+block, and Go's decoder reads back what this encoder makes of every
+list. Two of Go's departures are counted apart: it takes a size update
+after a field while its table is empty (RFC 7541 §4.2 puts one at the
+start of a block only), and refuses a second size update at a block's
+start while its table is not empty, though §4.2 has an encoder send the
+smallest size and then the new one (Go's encoder does).
+
+`h2spec.py` runs h2spec, HTTP/2's conformance suite, against
+goose-httpd over TLS 1.3 and over TCP: all of it passes but, over TCP,
+the test of an invalid connection preface, which to a port that takes
+HTTP/1.1 as well is a request of HTTP/1.1, answered with 400.
 
 `url_differential.py` parses every string literal of Go's net/url tests,
 RFC 3986 §5.4's examples and generated URLs with `http.url` and with Go's
@@ -155,6 +178,10 @@ and TLS 1.3, all on 127.0.0.1: files up to 1 MiB, HEAD, 301, 404, 405,
 bodies of 0 to 1 MiB with lengths and chunked, Expect: 100-continue,
 connection reuse, Connection: close, trailers, bodies to the close, ALPN
 http/1.1, and raw bytes (pipelining, CL with TE, bare LF, a 64 KiB head).
+And by HTTP/2, over TLS 1.3, TLS 1.2 and h2c: curl (1 MiB both ways,
+HEAD, 20 requests in parallel on one connection), nghttp (10 streams of 1
+MiB at once), h2load (2,000 requests over 4 connections, 25 streams
+each) and Go's client (the same checks, and 40 streams at once).
 
 Then the client's policy, through goose-http: Go's table of redirect
 methods (TestClientRedirectTypes: six methods, five statuses, and whether

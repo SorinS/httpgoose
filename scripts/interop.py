@@ -142,6 +142,50 @@ def curl_cases(port, tls, ca):
         check(f"{tag}: TLS {tls} and ALPN http/1.1", f"TLSv{tls}" in e and alpn, e[-300:])
 
 
+def h2_server_cases(port, tls, ca, gi):
+    """goose-httpd by HTTP/2: over TLS by ALPN, over TCP with prior knowledge."""
+    scheme = "https" if tls else "http"
+    host = "localhost" if tls else "127.0.0.1"
+    base = f"{scheme}://{host}:{port}"
+    tag = f"h2 {'tls ' + tls if tls else 'h2c'}"
+    opts = ["-s", "--http2" if tls else "--http2-prior-knowledge"] + (["--cacert", ca] if tls else [])
+    rc, out, err = run([CURL, *opts, "-w", "%{http_version}", "-o", "/dev/null", base + "/index.html"])
+    check(f"{tag}: curl speaks HTTP/2", rc == 0 and out == b"2", out[:100] + err[:200])
+    rc, out, err = run([CURL, *opts, base + "/big.bin"])
+    check(f"{tag}: curl GET 1 MiB", rc == 0 and out == big())
+    rc, out, err = run([CURL, *opts, "--data-binary", "@-", base + "/echo"], data=big())
+    check(f"{tag}: curl POST 1 MiB", rc == 0 and out == big())
+    rc, out, err = run([CURL, *opts, "-I", base + "/big.bin"])
+    check(f"{tag}: curl HEAD", rc == 0 and out.startswith(b"HTTP/2 200") and b"content-length: 1048576" in out, out[:200])
+    rc, out, err = run([CURL, *opts, "-o", "/dev/null", "-w", "%{http_code}", base + "/missing"])
+    check(f"{tag}: curl 404", out == b"404")
+    urls = [base + p for p in ("/index.html", "/big.bin", "/sub/a.txt", "/missing")] * 5
+    rc, out, err = run([CURL, *opts, "--parallel", "--parallel-max", "20", "-w", "%{http_code} %{num_connects}\n",
+                        *sum((["-o", "/dev/null", u] for u in urls), [])])
+    codes = out.decode().split()
+    check(f"{tag}: curl, 20 requests in parallel on one connection",
+          rc == 0 and sorted(codes[0::2]) == sorted(["200"] * 15 + ["404"] * 5) and sum(map(int, codes[1::2])) == 1, out[:300])
+    if shutil.which("nghttp"):
+        nopts = [] if tls else []
+        rc, out, err = run(["nghttp", "-n", "-s", "-m", "10", base + "/big.bin"])
+        check(f"{tag}: nghttp, 10 GETs of 1 MiB at once", rc == 0 and out.count(b"/big.bin") >= 10 and b"200" in out,
+              out[-300:] + err[-300:])
+        rc, out, err = run(["nghttp", "-n", "-d", "-", base + "/echo"], data=big())
+        check(f"{tag}: nghttp POST 1 MiB", rc == 0, err[-300:])
+    if shutil.which("h2load"):
+        rc, out, err = run(["h2load", "-n", "2000", "-c", "4", "-m", "25", base + "/index.html"], timeout=120)
+        m = re.search(rb"requests: (\d+) total, \d+ started, (\d+) done, (\d+) succeeded, (\d+) failed, (\d+) errored", out)
+        check(f"{tag}: h2load, 2000 requests over 4 connections, 25 streams each",
+              rc == 0 and m is not None and m.group(3) == b"2000" and m.group(4) == b"0" and m.group(5) == b"0", out[-400:])
+    gopts = ["-cacert", ca, "-tlsmax", tls] if tls else []
+    rc, out, err = run([gi, "client", "-h2", "-base", base, *gopts], timeout=120)
+    for line in out.decode().splitlines():
+        ok = line.startswith("ok ")
+        check(f"{tag}: go " + line.split(" ", 1)[1].split(":")[0], ok, line)
+    if rc not in (0, 1) or not out:
+        check(f"{tag}: go client ran", False, err.decode()[:300])
+
+
 def python_cases(port, tls, ca):
     tag = f"python {tls or 'tcp'}"
     if tls:
@@ -749,6 +793,9 @@ def main():
             if rc not in (0, 1) or not out:
                 check(f"go {tls or 'tcp'}: client ran", False, err.decode()[:300])
         raw_cases(plain.port)
+        h2_server_cases(t13.port, "1.3", cert, gi)
+        h2_server_cases(t12.port, "1.2", cert, gi)
+        h2_server_cases(plain.port, None, cert, gi)
         # goose-http against Go's server, and a Python HTTP/1.0 one.
         go_re = r"listening 127\.0\.0\.1:(\d+)"
         g0 = Server([gi, "server"], go_re, "stdout")
