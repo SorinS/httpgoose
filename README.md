@@ -127,8 +127,6 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
 - `Client` is a `root struct`, so it can't be returned from a function or
   kept inside another struct.
 - Digest's `nc` is always 1, so each request answers a fresh challenge.
-- The public suffix lookup scans the list (about 200 KB) on every cookie
-  set or sent.
 
 ## Tests
 

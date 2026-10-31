@@ -287,16 +287,51 @@ fn format_http_date(out: u8[>..]&, ms: i64) {
 // --- The public suffix list ------------------------------------------------
 
 // publicsuffix.org's rules, one a line ("com", "*.ck", "!www.ck"), kept as
-// "\n" rule "\n" text for lookups; empty for none.
-struct Psl { rules: u8[>..] }
+// "\n" rule "\n" text (text_len bytes), then a hash table of `slots` u32
+// entries, each 0 or one more than where a rule starts in the text, found
+// by FNV-1a and linear probing; empty for none.
+struct Psl { text_len: i64, slots: i64, rules: u8[>..] }
 
-fn empty_psl() -> Psl { Psl { rules: [] } }
+fn empty_psl() -> Psl { Psl { text_len: 0, slots: 0, rules: [] } }
+
+fn psl_hash(rule: const u8[:]) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for ch in rule { h = (h ^ ch) * 0x100000001b3; }
+    return h;
+}
+
+fn psl_slot(p: const Psl&, k: i64) -> i64 {
+    let at = p.text_len + k * 4;
+    return (p.rules[at] as i64) | ((p.rules[at + 1] as i64) << 8) | ((p.rules[at + 2] as i64) << 16) | ((p.rules[at + 3] as i64) << 24);
+}
+
+// The table for the text: at least twice as many slots as rules.
+fn psl_index(p: Psl&) {
+    p.rules.resize(p.text_len);
+    var count = 0;
+    for ch in p.rules { if ch == '\n' { count++; } }
+    var slots: i64 = 16;
+    while slots < 2 * count { slots *= 2; }
+    p.slots = slots;
+    p.rules.resize(p.text_len + slots * 4, 0);
+    var pos = 1;
+    while pos < p.text_len {
+        var end = pos;
+        while p.rules[end] != '\n' { end++; }
+        var k = (psl_hash(p.rules[pos..end]) & ((slots - 1) as! u64)) as! i64;
+        while psl_slot(p, k) != 0 { k = (k + 1) & (slots - 1); }
+        let v = pos + 1;
+        for b in 4 { p.rules[p.text_len + k * 4 + b] = ((v >> (b * 8)) & 0xff) as! u8; }
+        pos = end + 1;
+    }
+}
 
 // Adds the rules of a list in publicsuffix.org's format: comments ("//")
 // and blank lines skipped, each rule up to its first whitespace, lowered,
 // non-ASCII labels in Punycode.
 fn psl_load(p: Psl&, text: const u8[:]) -> i64 {
     var n = 0;
+    p.rules.resize(p.text_len);
     if p.rules.len == 0 { p.rules.push('\n'); }
     each_split(text, '\n') {
         var line = it;
@@ -318,6 +353,8 @@ fn psl_load(p: Psl&, text: const u8[:]) -> i64 {
             }
         }
     };
+    p.text_len = p.rules.len;
+    psl_index(p);
     return n;
 }
 
@@ -344,14 +381,19 @@ fn registrable_domain(p: const Psl&, name: const u8[:]) -> u8[>..], bool {
 }
 
 fn psl_has(p: const Psl&, rule: const u8[:]) -> bool {
-    var key: u8[>..] = [];
-    key.push('\n');
-    key.append(rule);
-    key.push('\n');
-    return find(p.rules[..], key[..]) >= 0;
+    if p.slots == 0 { return false; }
+    var k = (psl_hash(rule) & ((p.slots - 1) as! u64)) as! i64;
+    while true {
+        let v = psl_slot(p, k);
+        if v == 0 { return false; }
+        let at = v - 1;
+        if at + rule.len < p.text_len && p.rules[at + rule.len] == '\n' && p.rules[at..at + rule.len] == rule { return true; }
+        k = (k + 1) & (p.slots - 1);
+    }
+    return false;
 }
 
-fn psl_empty(p: const Psl&) -> bool { p.rules.len <= 1 }
+fn psl_empty(p: const Psl&) -> bool { p.text_len <= 1 }
 
 // The public suffix of a lowercase ASCII domain by the list's algorithm:
 // the longest matching rule, an exception rule winning and taking its
