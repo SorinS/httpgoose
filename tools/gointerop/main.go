@@ -8,7 +8,8 @@
 // The server prints "listening ADDR" and serves /hello, /chunked,
 // /trailer, /big, /echo, /status/N and /close, and for goose-http's
 // policy: /redir?status=N&to=URL, /chain/N, /inspect (what arrived:
-// method, body length, fields), /setcookie?c=LINE..., /cookies, /basic
+// method, body length, fields; X-Length and X-TE: the Content-Length and
+// Transfer-Encoding), /setcookie?c=LINE..., /cookies, /basic
 // and /bearer (credentials alice:secret, token tok123), /gzip and
 // /gzip-bad (a 1 MiB body gzipped, and cut short), /slow (3 s), /tls
 // (the connection's TLS version, whether it resumed, and the protocol). The
@@ -267,6 +268,8 @@ func policy(mux *http.ServeMux) {
 		b, _ := io.ReadAll(r.Body)
 		w.Header().Set("X-Method", r.Method)
 		w.Header().Set("X-Body", strconv.Itoa(len(b)))
+		w.Header().Set("X-Length", strconv.FormatInt(r.ContentLength, 10))
+		w.Header().Set("X-TE", strings.Join(r.TransferEncoding, ","))
 		var names []string
 		for k := range r.Header {
 			names = append(names, k)

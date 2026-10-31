@@ -279,6 +279,26 @@ fn drop_coding_fields(r: Response&) {
 // cannot be followed past max_redirects gives the last response with
 // ERR_REDIRECTS (its body closed), as Go gives it with an error.
 fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const u8[:], body: const u8[:]) -> Response {
+    return fetch_core(c, method0, url_text, fields, body, false, 0, false) { out: u8[>..]&, start: bool => false };
+}
+
+// fetch, the body read as it is sent: F(out, start) appends the next of
+// it to out and says whether more follows; `start` is true at the first
+// call of each sending, when a `rewindable` body starts again from its
+// beginning (Go's GetBody). F is a block `{ out: u8[>..]&, start: bool =>
+// ... }`. `length` is the body's length (-1: unknown, sent in chunks). A
+// hop that would send the body again (a 307 or 308, credentials
+// answering a 401 or 407) after some of a body that is not rewindable has
+// gone gives that response instead, as Go does without GetBody; with
+// "Expect: 100-continue" in the fields such an answer may come before the
+// body goes, and the hop goes ahead.
+fn fetch_stream<F>(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const u8[:], length: i64,
+                   rewindable: bool) -> Response {
+    return fetch_core(c, method0, url_text, fields, "", true, length, rewindable) { out: u8[>..]&, start: bool => F(out, start) };
+}
+
+fn fetch_core<F>(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const u8[:], body: const u8[:],
+                 stream: bool, length: i64, rewindable: bool) -> Response {
     c.deadline = if c.opt.timeout_ms > 0 { clock_ns() + c.opt.timeout_ms * 1000000 } else { 0 };
     let u0, ue = url_parse(url_text);
     if ue != URL_OK || url_check_http(u0) != URL_OK { return empty_response(ERR_URL); }
@@ -295,6 +315,7 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
     var authz: u8[>..] = [];        // an Authorization answering this hop's challenge
     var auth_tried = false;
     var proxy_tried = false;
+    var consumed = false;           // some of a streamed body has been read
     while true {
         // This hop's fields.
         var f = copy_fields(fields, strip_sensitive, !include_body);
@@ -366,7 +387,24 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
             let pu_user, pu_pass, has_pcred = proxy_userinfo(c, cur);
             if has_pcred { basic_credentials(c.proxy_authz, pu_user, pu_pass); }
         }
-        var r = round_trip(c, method, cur, f, if include_body { body } else { "" });
+        let streaming = stream && include_body;
+        var r = if streaming { begin_request(c, method, cur, fields_without(f, "Transfer-Encoding"), length) }
+                else { round_trip(c, method, cur, f, if include_body { body } else { "" }) };
+        if streaming && r.err == ERR_NONE {
+            var piece: u8[>..] = [];
+            var more = true;
+            var start = true;
+            while more && !r.early && r.write_err == ERR_NONE {
+                piece.clear();
+                more = F(piece, start);
+                start = false;
+                consumed = true;
+                if piece.len > 0 && write_body(c, r, piece) == ERR_REQUEST { break; }
+            }
+            end_request(c, r, "");
+        }
+        // A hop that sends the body again needs one that is still to read.
+        let resend_ok = !streaming || !consumed || rewindable;
         // A proxy that wants other credentials for a tunnel (407 to CONNECT).
         if r.err == ERR_PROXY && c.proxy_status == 407 && !proxy_tried {
             let pu_user, pu_pass, has_pcred = proxy_userinfo(c, cur);
@@ -406,7 +444,7 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
                 // An answer the same as what was sent (Basic at once, a server
                 // that asks for Basic again) would get the same 401.
                 let sent, had = field_value(f, "Authorization");
-                if a.len > 0 && !(had && sent == a[..]) {
+                if a.len > 0 && !(had && sent == a[..]) && resend_ok {
                     close_body(c, r);
                     authz.clear();
                     authz.append(a);
@@ -434,7 +472,7 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
                 var chosen: u8[>..] = [];
                 let a = answer_challenge(response_fields(r), "Proxy-Authenticate", pu_user, pu_pass, AUTH_ANY, method,
                                          target, if include_body { body } else { "" }, chosen);
-                if a.len > 0 && a[..] != c.proxy_authz[..] {
+                if a.len > 0 && a[..] != c.proxy_authz[..] && resend_ok {
                     close_body(c, r);
                     c.proxy_authz.clear();
                     c.proxy_authz.append(a);
@@ -445,7 +483,8 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
         }
         // Redirects.
         let st = r.status;
-        let redirect = st == 301 || st == 302 || st == 303 || st == 307 || st == 308;
+        // 307 and 308 send the body again (Go: unless it cannot be had again).
+        let redirect = st == 301 || st == 302 || st == 303 || ((st == 307 || st == 308) && (resend_ok || !include_body));
         if !redirect || !c.opt.follow_redirects {
             finish_response(c, r, want_gzip, redirects);
             return r;

@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import http.client
 import os
+import random
 import re
 import shutil
 import socket
@@ -554,6 +555,108 @@ def proxy_cases(gh, gi, cert, g0, g13, env_base, servers):
     check("proxy: --noproxy", rc == 1 and b"resolve" in err, err[:200])
 
 
+def upload_cases(gh, cert, g0, h0, h13, tmp, env_base):
+    """Bodies sent as they are read (-T): files and stdin, Expect: 100-continue,
+    hops that send the body again, and a server's refusal before the end."""
+    big_f, mid_f, small_f = (os.path.join(tmp, n) for n in ("up-big.bin", "up-mid.bin", "up-small.txt"))
+    rnd = random.Random(7)
+    with open(big_f, "wb") as f:
+        f.write(rnd.randbytes(50 << 20))
+    with open(mid_f, "wb") as f:
+        f.write(rnd.randbytes(3000000))
+    mid = open(mid_f, "rb").read()
+    with open(small_f, "w") as f:
+        f.write("small\n")
+    plain = f"http://127.0.0.1:{g0}"
+
+    def gx(*a, data=None):
+        p = subprocess.run([gh, *a], input=data, capture_output=True, timeout=120, env=env_base)
+        return p.returncode, p.stdout, p.stderr
+
+    def field(out, name):
+        m = re.search(rb"(?im)^" + name.encode() + rb": *(.*?)\r?$", out)
+        return m.group(1).decode() if m else None
+
+    # 50 MiB echoed back, read as it went: the client's memory stays small.
+    meter = ("import resource, subprocess, sys\n"
+             "p = subprocess.run(sys.argv[1:], capture_output=True)\n"
+             "rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+             "rss = rss if sys.platform == 'darwin' else rss * 1024\n"
+             "sys.stdout.buffer.write(b'%d %d %d\\n' % (p.returncode, len(p.stdout), rss))\n")
+    p = subprocess.run([sys.executable, "-c", meter, gh, "-T", big_f, f"{plain}/echo"], capture_output=True, timeout=120,
+                       env=env_base)
+    rc, n, rss = (int(x) for x in p.stdout.split())
+    check(f"upload: 50 MiB file echoed, the client under 20 MB ({rss >> 20} MB)", rc == 0 and n == 50 << 20 and rss < 20 << 20)
+    rc, out, err = gx("-i", "-T", mid_f, f"{plain}/inspect")
+    check("upload: a file with its Content-Length, PUT, Expect: 100-continue over 1 MiB",
+          rc == 0 and field(out, "X-Method") == "PUT" and field(out, "X-Length") == "3000000" and
+          field(out, "X-Body") == "3000000" and b"Expect: 100-continue" in out, out[:300])
+    rc, out, err = gx("-i", "-T", "-", f"{plain}/inspect", data=mid)
+    check("upload: stdin in chunks", rc == 0 and field(out, "X-Length") == "-1" and field(out, "X-TE") == "chunked" and
+          field(out, "X-Body") == "3000000", out[:300])
+    rc, out, err = gx("-i", "-T", small_f, f"{plain}/inspect")
+    check("upload: a small file, no Expect", rc == 0 and field(out, "X-Body") == "6" and b"Expect" not in out, out[:300])
+    rc, out, err = gx("-i", "-H", "Expect:", "-T", mid_f, f"{plain}/inspect")
+    check("upload: -H 'Expect:' drops it", rc == 0 and field(out, "X-Body") == "3000000" and b"Expect" not in out, out[:300])
+    # curl sends the same framing.
+    crc, cout, cerr = run([CURL, "-s", "-i", "-T", "-", f"{plain}/inspect"], data=mid)
+    check("upload: stdin framed as curl frames it", crc == 0 and field(cout, "X-TE") == "chunked", cout[:200])
+    to307 = f"{plain}/redir?status=307&to=/inspect"
+    rc, out, err = gx("-i", "-L", "-T", mid_f, to307)
+    check("upload: a 307 sends a file again", rc == 0 and field(out, "X-Body") == "3000000", out[:300])
+    rc, out, err = gx("-i", "-L", "-T", "-", to307, data=mid)
+    check("upload: a 307 after stdin went is handed back (Go without GetBody)", rc == 0 and out.startswith(b"HTTP/1.1 307"),
+          out[:200])
+    rc, out, err = gx("--anyauth", "-u", "alice:secret", "-T", "-", f"{plain}/basic", data=mid)
+    check("upload: a 401 before the 100, answered, then stdin sent", rc == 0 and out == b"hello alice", out[:200])
+    rc, out, err = gx("--anyauth", "-u", "alice:secret", "-T", small_f, f"{plain}/basic")
+    check("upload: a 401 after a file went, the file sent again", rc == 0 and out == b"hello alice", out[:200])
+    # goose-httpd: POST /echo, 413 past 16 MiB, a URL ending in "/".
+    hp = f"http://127.0.0.1:{h0}"
+    rc, out, err = gx("-X", "POST", "-T", mid_f, f"{hp}/echo")
+    check("upload: goose-httpd echoes a file", rc == 0 and out == mid)
+    rc, out, err = gx("-X", "POST", "--cacert", cert, "-T", "-", f"https://localhost:{h13}/echo", data=mid)
+    check("upload: goose-httpd echoes stdin over TLS 1.3", rc == 0 and out == mid)
+    for tag, opts, data in (("with Expect", ["-T", big_f], None), ("without Expect", ["-H", "Expect:", "-T", big_f], None),
+                            ("in chunks, past 16 MiB", ["-H", "Expect:", "-T", "-"], open(big_f, "rb").read())):
+        t0 = time.time()
+        rc, out, err = gx("-i", "-X", "POST", *opts, f"{hp}/echo", data=data)
+        check(f"upload: goose-httpd's 413 {tag}, the rest not sent ({time.time() - t0:.1f} s)",
+              rc == 1 and out.startswith(b"HTTP/1.1 413") and time.time() - t0 < 5, out[:100] + err[:200])
+    # A server that never sends the 100: the body goes after
+    # --expect100-timeout (1 s by default, as curl and Go's DefaultTransport).
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(4)
+    def silent_server():
+        for _ in range(2):
+            try:
+                cs, _ = ls.accept()
+            except OSError:
+                return
+            with cs:
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    got += cs.recv(65536)
+                head, body = got.split(b"\r\n\r\n", 1)
+                n = int(re.search(rb"(?i)content-length: *(\d+)", head).group(1))
+                while len(body) < n:
+                    body += cs.recv(65536)
+                cs.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%d" % (len(str(n)), n))
+    th = threading.Thread(target=silent_server, daemon=True)
+    th.start()
+    for opts, lo, hi in (([], 0.9, 3.0), (["--expect100-timeout", "0.2"], 0.15, 0.9)):
+        t0 = time.time()
+        rc, out, err = gx(*opts, "-T", mid_f, f"http://127.0.0.1:{ls.getsockname()[1]}/")
+        dt = time.time() - t0
+        check(f"upload: no 100 comes, the body goes after the wait {' '.join(opts) or '(1 s)'} ({dt:.1f} s)",
+              rc == 0 and out == b"3000000" and lo <= dt <= hi, out[:100] + err[:200])
+    ls.close()
+    rc, out, err = gx("-T", small_f, f"{hp}/up/")
+    check("upload: a URL ending in / gets the file's name", rc == 1 and out == b"Method Not Allowed\n")
+    return f"PUT /up/up-small.txt 405"
+
+
 def session_cases(gh, cert, g12, g13, late, env_base):
     """TLS session resumption, as Go's server reports it on /tls."""
     def gx(*a):
@@ -669,6 +772,9 @@ def main():
         late = Server([httpd, "--root", www, "--port", "0", "--cert", cert, "--key", key, "--late-ticket"], port_re)
         servers.append(late)
         session_cases(gh, cert, g12.port, g13.port, late.port, env_base)
+        line = upload_cases(gh, cert, g0.port, plain.port, t13.port, tmp, env_base)
+        time.sleep(0.2)
+        check("upload: goose-httpd saw the file's name", any(line in l for l in plain.log))
         bad = 0
         for s in servers:
             for l in s.log:

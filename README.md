@@ -12,8 +12,8 @@ writes byte strings, and the caller owns the sockets.
 | `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt |
 | `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
 | `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
-| `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, bodies read whole or as a stream; HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
-| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch` |
+| `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
+| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch`, and `fetch_stream` for a body read as it is sent (started again for a hop that sends it again if it can be, as Go's GetBody; else that hop's response is handed back, as Go does) |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
@@ -109,7 +109,9 @@ options: `-L`, `--max-redirs`, `-u` with `--basic`/`--digest`/`--anyauth`,
 `--oauth2-bearer`, `-x` (http, https, socks5, socks5h) and `--noproxy`
 (else the proxy environment variables, as curl reads them), `-b`/`-c`
 cookie files, `--compressed`, `-I`, `-i`, `-o`, `-A`, `-e`, `--cacert`,
-`-k`, `--tls-max`, `--connect-timeout`, `-m`, `--rate`. It keeps a
+`-k`, `--tls-max`, `--connect-timeout`, `-m`, `--rate`, and `-T` to
+upload a file or stdin as it is read (chunks for stdin; Expect:
+100-continue over 1 MiB, `--expect100-timeout`), as curl does. It keeps a
 connection for URLs of one origin, and TLS sessions to resume new ones.
 `goose-httpd --late-ticket` sends a TLS 1.3 session ticket after each
 response, when the connection is idle, for testing clients.
@@ -122,7 +124,6 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
 ## Not yet
 
 - HTTP/2.
-- Request bodies are in memory: no streaming upload.
 - One response is read at a time per `Client`.
 - `Client` is a `root struct`, so it can't be returned from a function or
   kept inside another struct.

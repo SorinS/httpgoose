@@ -4,6 +4,11 @@
 //
 //   -X METHOD           the method (default GET, or POST with -d)
 //   -d DATA, -d @FILE   a body (--data-binary the same; "-" or @- reads stdin)
+//   -T FILE             upload FILE ("-": stdin) with PUT, read as it is sent, in
+//                       chunks if its size is not known; to URL/FILE's name if
+//                       the URL ends in "/". Expect: 100-continue goes with it
+//                       over 1 MiB or of unknown size (-H 'Expect:' for none)
+//   --expect100-timeout S   how long to wait for the 100 (default 1)
 //   --chunked           send the body in chunks
 //   -H 'Name: value'    a request field
 //   -A AGENT, -e URL    User-Agent, Referer
@@ -41,6 +46,12 @@ import http.url;
 import http.cookie;
 import http.client;
 import http.fetch;
+
+extern fn upfile_open(path: const u8[:]) -> i64;
+extern fn upfile_size(fd: i64) -> i64;
+extern fn upfile_read(fd: i64, buf: u8[:]) -> i64;
+extern fn upfile_rewind(fd: i64) -> bool;
+extern fn upfile_close(fd: i64);
 
 var silent = false;
 var verbose = false;
@@ -83,6 +94,42 @@ fn read_data(arg: const u8[:], out: u8[>..]&) {
     out.append(arg);
 }
 
+// The file read as it is sent: -T.
+fn upload_to(c: http::Client&, method: const u8[:], url: const u8[:], fields: const u8[:], path: const u8[:], no_expect: bool) -> http::Response {
+    let fd = upfile_open(path);
+    if fd < 0 { die("cannot read the -T file"); }
+    let size = upfile_size(fd);
+    // A URL ending in "/" gets the file's name, as curl does.
+    var target: u8[>..] = [];
+    target.append(url);
+    let q = position(url, '?');
+    let path_end = if q < 0 { url.len } else { q };
+    if path != "-" && path_end > 0 && url[path_end - 1] == '/' {
+        target.resize(path_end);
+        let slash = http::last_index(path, '/');
+        http::path_escape(target, path[slash + 1..]);
+        target.append(url[path_end..]);
+    }
+    var f: u8[>..] = [];
+    f.append(fields);
+    if !no_expect && (size < 0 || size > (1 << 20)) && !http::has_field(f, "Expect") {
+        http::add_field(f, "Expect", "100-continue");
+    }
+    var failed = false;
+    // A file is read again for a hop that sends it again (curl rewinds it
+    // too); standard input cannot be.
+    var r = http::fetch_stream(c, method, target, f, size, size >= 0) { out: u8[>..]&, start: bool =>
+        if start && size >= 0 && !upfile_rewind(fd) { failed = true; }
+        let at = out.len;
+        out.resize(at + 65536, 0);
+        let n = if failed { -1 } else { upfile_read(fd, out[at..]) };
+        if n < 0 { failed = true; out.resize(at); false } else { out.resize(at + n); n > 0 }
+    };
+    upfile_close(fd);
+    if failed { die("reading the -T file failed"); }
+    return r;
+}
+
 fn main() {
     let a = args();
     var c = http::Client { .. };
@@ -106,6 +153,8 @@ fn main() {
     var cacert: u8[>..] = [];
     var tls12 = false;
     var interval_ms: i64 = 0;
+    var upload: u8[>..] = [];
+    var no_expect = false;
     var urls: u8[>..] = [];             // NUL-separated
     var i = 1;
     while i < a.len {
@@ -118,10 +167,14 @@ fn main() {
             has_data = true;
             i += 2;
         }
+        else if (s == "-T" || s == "--upload-file") && has_next { upload.clear(); upload.append(next); i += 2; }
+        else if s == "--expect100-timeout" && has_next { c.opt.expect_continue_ms = seconds_ms(next); i += 2; }
         else if s == "--chunked" { http::add_field(fields, "Transfer-Encoding", "chunked"); i++; }
         else if s == "-H" && has_next {
             let colon = position(next, ':');
             if colon <= 0 { die("-H takes 'Name: value'"); }
+            // "Expect:" with nothing after it: no Expect (curl's way to drop a field it adds).
+            if http::eq_fold(next[..colon], "Expect") && http::trim_ows(next[colon + 1..]).len == 0 { no_expect = true; i += 2; continue; }
             if !http::add_field(fields, next[..colon], http::trim_ows(next[colon + 1..])) { die("-H: not a valid field"); }
             i += 2;
         }
@@ -177,7 +230,8 @@ fn main() {
         else { urls.append(s); urls.push(0); i++; }
     }
     if urls.len == 0 { die("no URL"); }
-    if method.len == 0 { method.append(if head_only { "HEAD" } else if has_data { "POST" } else { "GET" }); }
+    if method.len == 0 { method.append(if head_only { "HEAD" } else if upload.len > 0 { "PUT" } else if has_data { "POST" } else { "GET" }); }
+    if upload.len > 0 && has_data { die("-T and -d do not go together"); }
     if has_data && !head_only {
         let ct, has_ct = http::field_value(fields, "Content-Type");
         if !has_ct { http::add_field(fields, "Content-Type", "application/x-www-form-urlencoded"); }
@@ -215,7 +269,7 @@ fn main() {
                 if last_start >= 0 && now < last_start + interval_ms { sleep_ms(last_start + interval_ms - now); }
                 last_start = clock_ns() / 1000000;
             }
-            var r = http::fetch(c, method, us, fields, data);
+            var r = if upload.len > 0 { upload_to(c, method, us, fields, upload, no_expect) } else { http::fetch(c, method, us, fields, data) };
             if r.err != http::ERR_NONE {
                 if r.err == http::ERR_REDIRECTS { say("too many redirects at ", http::response_url(r)); }
                 else { say(http::client_error_text(r.err), if r.status > 0 { " (the proxy answered with a refusal)" } else { "" }); }

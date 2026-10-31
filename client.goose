@@ -94,6 +94,7 @@ struct ClientOptions {
     cookies: bool,                  // keep cookies in the client's jar and send them (Go's Client.Jar)
     auth: u8,                       // how the client's credentials are sent: AUTH_*
     tls_sessions: i64,              // TLS sessions kept to resume, one per server name (0: none)
+    expect_continue_ms: i64,        // with Expect: 100-continue, how long to wait for the 100 before the body goes (Go's ExpectContinueTimeout; 0: no wait)
     user_agent: u8[..256],          // sent unless the request has one; empty: none
 }
 
@@ -108,7 +109,7 @@ fn client_options() -> ClientOptions {
     var o = ClientOptions {
         connect_timeout_ms: 30000, read_timeout_ms: 0, timeout_ms: 0, max_idle: 100, max_idle_per_host: 2,
         max_body: 1 << 30, max_redirects: 10, follow_redirects: true, compression: true, insecure: false,
-        cookies: false, auth: AUTH_ANY, tls_sessions: 64, user_agent: [],
+        cookies: false, auth: AUTH_ANY, tls_sessions: 64, expect_continue_ms: 1000, user_agent: [],
     };
     o.user_agent.append("goose-http-client/1.1");
     return o;
@@ -122,6 +123,7 @@ struct PoolConn {
     key: u8[..600],                 // what it reaches: scheme, host, port, and the proxy's
     is_tls: bool,
     reused: bool,                   // it has carried a request before this one
+    must_close: bool,               // a request's body was not all sent: closed after its response
     last_used: i64,                 // clock_ns() when it went idle
     server_name: u8[..255],
     sess_sig: u64,                  // the TLS session last put in the cache from it
@@ -167,6 +169,7 @@ root struct Client {
     proxy_authz: u8[>..] = [],      // the Proxy-Authorization value to send, if any
     proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
     proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
+    pend: u8[>..] = [],             // a request's head and body not sent yet
     sessions: u8[>..] = [],         // the TLS session cache: records of session_put
     digest_base: u8[>..] = [],      // the URL whose 401 the client's Digest answered (http.fetch), empty for none
     digest_params: u8[>..] = [],    // that challenge's params, answered again with digest_nc + 1
@@ -196,6 +199,11 @@ struct Response {
     tls_version: u16,               // the connection's TLS version, 0 for none
     tls_resumed: bool,              // its handshake resumed a session
     reused: bool,                   // the connection had carried a request before (Go's GotConnInfo.Reused)
+    sending: bool,                  // begin_request's: the body is being sent (write_body, then end_request)
+    early: bool,                    // a final response came before the body was all sent: the rest is not sent
+    length: i64,                    // the body's length as declared, -1 for chunks
+    sent: i64,                      // what of it has gone
+    write_err: i64,                 // the error sending it met, if any
     data: u8[>..],
 }
 
@@ -203,8 +211,34 @@ fn empty_response(err: i64) -> Response {
     Response {
         err: err, status: 0, minor: 1, reason: empty_span(), url: empty_span(), fields: empty_span(),
         trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false,
-        tls_version: 0, tls_resumed: false, reused: false, data: [],
+        tls_version: 0, tls_resumed: false, reused: false,
+        sending: false, early: false, length: 0, sent: 0, write_err: 0, data: [],
     }
+}
+
+// Every field as empty_response has it.
+fn reset_response(r: Response&, err: i64) {
+    r.err = err;
+    r.status = 0;
+    r.minor = 1;
+    r.reason = empty_span();
+    r.url = empty_span();
+    r.fields = empty_span();
+    r.trailer = empty_span();
+    r.body = empty_span();
+    r.redirects = 0;
+    r.conn = -1;
+    r.body_done = true;
+    r.decode = false;
+    r.tls_version = 0;
+    r.tls_resumed = false;
+    r.reused = false;
+    r.sending = false;
+    r.early = false;
+    r.length = 0;
+    r.sent = 0;
+    r.write_err = 0;
+    r.data.clear();
 }
 
 fn response_part(r: const Response&, s: Span) -> const u8[:] { r.data[s.pos..s.end] }
@@ -307,7 +341,7 @@ fn close_idle(c: Client&) {
 fn new_slot(c: Client&) -> i64 {
     for i in c.conns.len { if !c.conns[i].used { return i; } }
     c.conns.push(PoolConn {
-        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, last_used: 0, server_name: [], sess_sig: 0,
+        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, must_close: false, last_used: 0, server_name: [], sess_sig: 0,
         outer: -1, via_proxy: false, hc: client_conn(), tc: tls::client(c.tlscfg),
     });
     return c.conns.len - 1;
@@ -369,7 +403,7 @@ fn conn_release(c: Client&, i: i64) {
     let pc: PoolConn& = c.conns[i];
     if c.open == i { c.open = -1; }
     if !pc.used { return; }
-    if !client_idle(pc.hc) || c.buf.len > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
+    if !client_idle(pc.hc) || pc.must_close || c.buf.len > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
         conn_close(c, i);
         return;
     }
@@ -591,11 +625,13 @@ fn conn_send(c: Client&, i: i64, data: const u8[:]) -> i64 {
 
 // Reads what comes into c.buf (decrypted): 1 if bytes came, 0 at the end
 // of the stream (TLS's close_notify included), or -ERR_*.
-fn conn_fill(c: Client&, i: i64) -> i64 {
+fn conn_fill(c: Client&, i: i64) -> i64 { conn_fill_t(c, i, c.opt.read_timeout_ms) }
+
+fn conn_fill_t(c: Client&, i: i64, timeout_op: i64) -> i64 {
     let pc: PoolConn& = c.conns[i];
-    if !pc.is_tls { return link_read(c, i, c.buf, c.opt.read_timeout_ms); }
+    if !pc.is_tls { return link_read(c, i, c.buf, timeout_op); }
     while true {
-        let n = link_read(c, i, c.mid, c.opt.read_timeout_ms);
+        let n = link_read(c, i, c.mid, timeout_op);
         if n <= 0 { return n; }
         let before = c.buf.len;
         c.wire.clear();
@@ -730,6 +766,7 @@ fn conn_dial(c: Client&, i: i64, host: const u8[:], port: i64) -> i64 {
     pc.fd = fd;
     pc.is_tls = false;
     pc.reused = false;
+    pc.must_close = false;
     pc.outer = -1;
     pc.via_proxy = false;
     pc.hc = client_conn();
@@ -1084,82 +1121,285 @@ fn fields_without(fields: const u8[:], name: const u8[:]) -> u8[>..] {
 // Sends one request and reads its response's head: a Response whose body
 // is to be read with read_body (or read_all), the connection checked out
 // of the pool until it ends. `fields` from add_field, without
-// Content-Length or Transfer-Encoding; a Host field in them is the Host
-// sent (Go's Request.Host), else the URL's. `body` goes with a
-// Content-Length, or in chunks if the fields have "Transfer-Encoding:
-// chunked". Through an HTTP proxy the target is absolute-form and
-// c.proxy_authz is sent as Proxy-Authorization.
+// Content-Length; a Host field in them is the Host sent (Go's
+// Request.Host), else the URL's. `body` goes with a Content-Length, or in
+// chunks if the fields have "Transfer-Encoding: chunked". Through an HTTP
+// proxy the target is absolute-form and c.proxy_authz is sent as
+// Proxy-Authorization. With "Expect: 100-continue" the body waits for the
+// 100 (opt.expect_continue_ms), and is not sent if a final response comes
+// first.
 //
 // A request on a reused connection that fails before any of the response
 // came is sent again on a new one if it is replayable (Go's
 // shouldRetryRequest).
 fn round_trip(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:], body: const u8[:]) -> Response {
-    if c.open >= 0 { return empty_response(ERR_STATE); }
-    if url_check_http(u) != URL_OK { return empty_response(ERR_URL); }
-    var host: u8[>..] = [];
-    let given, has_host = field_value(fields, "Host");
-    if has_host { host.append(given); } else if !host_port_field(u, host) { return empty_response(ERR_URL); }
-    var rest = fields_without(fields, "Host");
-    // "Transfer-Encoding: chunked" among the fields: the body goes in chunks.
     let te, has_te = field_value(fields, "Transfer-Encoding");
     if has_te && !eq_fold(te, "chunked") { return empty_response(ERR_REQUEST); }
-    let chunked = has_te;
-    remove_field(rest, "Transfer-Encoding");
+    let f = fields_without(fields, "Transfer-Encoding");
+    let length: i64 = if has_te { -1 } else { body.len };
     var attempt = 0;
     while true {
         attempt++;
-        let i = conn_for(c, u, attempt > 1);
-        if i < 0 { return empty_response(-i); }
-        let reused = c.conns[i].reused;
-        c.buf.clear();
-        c.mid.clear();
-        var target: u8[>..] = [];
-        var f: u8[>..] = [];
-        f.append(rest);
-        if c.conns[i].via_proxy {
-            absolute_target(u, target);
-            if c.proxy_authz.len > 0 { add_field(f, "Proxy-Authorization", c.proxy_authz); }
-        } else {
-            request_target(u, target);
+        var r = begin_on(c, method, u, f, length, attempt > 1);
+        if r.err == ERR_NONE {
+            send_body(c, r, body, true, "");
+            finish_request(c, r);
+            if r.err == ERR_NONE { return r; }
         }
-        var msg: u8[>..] = [];
-        var length: i64 = if body.len > 0 || method == "POST" || method == "PUT" || method == "PATCH" { body.len } else { 0 };
-        if chunked { length = -1; }
-        if !client_request(c.conns[i].hc, method, target, host, f, length, msg) {
-            conn_release(c, i);
-            return empty_response(ERR_REQUEST);
-        }
-        if chunked {
-            if body.len > 0 { write_chunk(msg, body); }
-            write_last_chunk(msg, "");
-        } else {
-            msg.append(body);
-        }
-        let se = conn_send(c, i, msg);
-        if se != ERR_NONE {
-            conn_close(c, i);
-            if reused && attempt == 1 && se == ERR_IO && replayable(method, fields) { continue; }
-            return empty_response(se);
-        }
-        c.open = i;
-        var r = read_head(c, i, u);
-        if r.err == ERR_NONE { return r; }
         // Nothing of a response came on a reused connection.
-        let retry = reused && attempt == 1 && r.status == -1 && replayable(method, fields);
-        conn_close(c, i);
-        if retry { continue; }
-        r.status = 0;
+        if r.reused && attempt == 1 && r.status == -1 && r.err == ERR_IO && replayable(method, fields) { continue; }
+        if r.status < 0 { r.status = 0; }
         return r;
     }
     return empty_response(ERR_IO);
 }
 
+// Starts a request whose body is sent as it comes: write_body, then
+// end_request, which reads the response's head. `length` is the body's
+// (Content-Length), or -1 to send it in chunks; fields as round_trip's,
+// without Transfer-Encoding. The head goes with the first of the body.
+// Such a request is not sent again on another connection once the body
+// has begun, as Go does with a body it cannot get again.
+fn begin_request(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:], length: i64) -> Response {
+    if has_field_named(fields, "Transfer-Encoding") || has_field_named(fields, "Content-Length") {
+        return empty_response(ERR_REQUEST);
+    }
+    var attempt = 0;
+    while true {
+        attempt++;
+        var r = begin_on(c, method, u, fields, length, attempt > 1);
+        // The head could not be sent on a reused connection: nothing of the
+        // request has gone, so it goes on a new one.
+        if r.err == ERR_IO && r.reused && attempt == 1 && r.status == -1 { continue; }
+        if r.status < 0 { r.status = 0; }
+        return r;
+    }
+    return empty_response(ERR_IO);
+}
+
+fn has_field_named(fields: const u8[:], name: const u8[:]) -> bool {
+    let v, ok = field_value(fields, name);
+    return ok;
+}
+
+// Sends more of a begun request's body: ERR_NONE, or what failed. A final
+// response that came already (a 413, say) stops the sending: the rest is
+// dropped and end_request reads that response. After an error too,
+// end_request reads a response if one came.
+fn write_body(c: Client&, r: Response&, data: const u8[:]) -> i64 {
+    if !r.sending { return ERR_STATE; }
+    if r.length >= 0 && r.sent + data.len > r.length { return ERR_REQUEST; }
+    send_body(c, r, data, false, "");
+    return r.write_err;
+}
+
+// Ends a begun request's body (a chunked one with these trailer fields,
+// "Name: value\r\n" lines) and reads the response's head into r, as
+// round_trip's. A body shorter than its declared length is ERR_REQUEST
+// (as Go's "ContentLength=N with Body length M"), and the connection is
+// closed.
+fn end_request(c: Client&, r: Response&, trailer: const u8[:]) -> i64 {
+    if !r.sending { return ERR_STATE; }
+    if r.length >= 0 && r.sent != r.length && !r.early && r.write_err == ERR_NONE {
+        let i = r.conn;
+        conn_close(c, i);
+        c.pend.clear();
+        let url_t = copy_url_text(r);
+        reset_response(r, ERR_REQUEST);
+        set_url(r, url_t);
+        return ERR_REQUEST;
+    }
+    send_body(c, r, "", true, trailer);
+    finish_request(c, r);
+    if r.status < 0 { r.status = 0; }
+    return r.err;
+}
+
+fn copy_url_text(r: const Response&) -> u8[>..] {
+    var t: u8[>..] = [];
+    t.append(response_url(r));
+    return t;
+}
+
+fn set_url(r: Response&, t: const u8[:]) {
+    r.data.clear();
+    r.data.append(t);
+    r.url = span(0, r.data.len);
+}
+
+// The connection and the head (held in c.pend until the body's first
+// bytes go, unless the request expects a 100). An error with status -1:
+// nothing was sent on a reused connection.
+fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:], length: i64, fresh: bool) -> Response {
+    var r = empty_response(ERR_NONE);
+    set_url(r, url_text(u));
+    if c.open >= 0 { r.err = ERR_STATE; return r; }
+    if url_check_http(u) != URL_OK { r.err = ERR_URL; return r; }
+    var host: u8[>..] = [];
+    let given, has_host = field_value(fields, "Host");
+    if has_host { host.append(given); } else if !host_port_field(u, host) { r.err = ERR_URL; return r; }
+    let i = conn_for(c, u, fresh);
+    if i < 0 { r.err = -i; return r; }
+    r.reused = c.conns[i].reused;
+    c.buf.clear();
+    c.mid.clear();
+    c.pend.clear();
+    var target: u8[>..] = [];
+    var f = fields_without(fields, "Host");
+    if c.conns[i].via_proxy {
+        absolute_target(u, target);
+        if c.proxy_authz.len > 0 { add_field(f, "Proxy-Authorization", c.proxy_authz); }
+    } else {
+        request_target(u, target);
+    }
+    // No body and a method that has none: no Content-Length (Go's
+    // outgoingLength); POST, PUT and PATCH say 0.
+    if !client_request(c.conns[i].hc, method, target, host, f, length, c.pend) {
+        c.pend.clear();
+        conn_release(c, i);
+        r.err = ERR_REQUEST;
+        return r;
+    }
+    c.open = i;
+    r.conn = i;
+    r.sending = true;
+    r.body_done = false;
+    r.length = length;
+    let ex, has_ex = field_value(fields, "Expect");
+    if has_ex && eq_fold(ex, "100-continue") && length != 0 {
+        let se = conn_send(c, i, c.pend);
+        c.pend.clear();
+        if se != ERR_NONE {
+            conn_close(c, i);
+            r.conn = -1;
+            r.sending = false;
+            r.err = se;
+            r.status = -1;
+            return r;
+        }
+        if c.opt.expect_continue_ms > 0 { wait_continue(c, r); }
+    }
+    return r;
+}
+
+// Sends c.pend (the head, if it has not gone) and `data`, as a chunk if the
+// body is chunked, and with `last` the end: the last chunk and trailer.
+fn send_body(c: Client&, r: Response&, data: const u8[:], last: bool, trailer: const u8[:]) {
+    if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
+    let i = r.conn;
+    // A response that has come already ends the sending.
+    if data.len > 0 && r.sent > 0 { poll_early(c, r); }
+    if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
+    if r.length < 0 {
+        if data.len > 0 { write_chunk(c.pend, data); }
+        if last { write_last_chunk(c.pend, trailer); }
+    } else {
+        c.pend.append(data);
+    }
+    r.sent += data.len;
+    if c.pend.len == 0 { return; }
+    let se = conn_send(c, i, c.pend);
+    c.pend.clear();
+    if se != ERR_NONE { r.write_err = se; }
+}
+
+// Whether a final response has come while the body is being sent: what
+// came is read without waiting; a 100 (or other 1xx) is taken, a final
+// head is left for read_head.
+fn poll_early(c: Client&, r: Response&) {
+    let i = r.conn;
+    let n = conn_poll(c, i);
+    if n <= 0 { r.early = true; return; }
+    peek_head(c, r);
+}
+
+// Takes interim responses from the front of c.buf; a final one there (or
+// one that does not parse) makes the request early.
+fn peek_head(c: Client&, r: Response&) -> bool {
+    let lim = default_limits();
+    while c.buf.len > 0 {
+        let h, n = parse_response(c.buf, lim);
+        if n == NEED_MORE { return false; }
+        if n < 0 { r.early = true; return true; }
+        if h.status >= 100 && h.status < 200 && h.status != 101 {
+            let cont = h.status == 100;
+            drop_front(c.buf, n);
+            if cont { return true; }
+            continue;
+        }
+        r.early = true;
+        return true;
+    }
+    return false;
+}
+
+// Expect: 100-continue: waits up to opt.expect_continue_ms for the 100,
+// or a final response (then the body is not sent).
+fn wait_continue(c: Client&, r: Response&) {
+    let i = r.conn;
+    let end = clock_ns() + c.opt.expect_continue_ms * 1000000;
+    while true {
+        if peek_head(c, r) { return; }
+        let left = (end - clock_ns()) / 1000000;
+        if left <= 0 { return; }
+        let n = conn_fill_t(c, i, left);
+        if n == -ERR_TIMEOUT { return; }
+        if n <= 0 { r.early = true; return; }
+    }
+}
+
+// Reads what has come on connection i into c.buf without waiting: 1, 0 if
+// the connection ended, or -ERR_*.
+fn conn_poll(c: Client&, i: i64) -> i64 {
+    while httpnet_readable(c.conns[i].fd) != 0 {
+        if !c.conns[i].is_tls {
+            let n = link_read(c, i, c.buf, 1000);
+            if n <= 0 { return n; }
+            continue;
+        }
+        c.mid.clear();
+        let n = link_read(c, i, c.mid, 1000);
+        if n <= 0 { c.mid.clear(); return n; }
+        c.wire.clear();
+        c.tlscfg.server_name.clear();
+        c.tlscfg.server_name.append(c.conns[i].server_name[..]);
+        let e = tls::client_feed(c.conns[i].tc, c.tlscfg, c.mid, c.wire, c.buf);
+        c.mid.clear();
+        if c.wire.len > 0 { link_write_wire(c, i, 1000); }
+        if e != 0 { return -ERR_TLS; }
+        keep_session(c, i, false);
+        if tls::closed(c.conns[i].tc) { return 0; }
+    }
+    return 1;
+}
+
+// The head of the response to a request whose body has gone (or was cut
+// short): into r. A body not all sent closes the connection after the
+// response.
+fn finish_request(c: Client&, r: Response&) {
+    let i = r.conn;
+    r.sending = false;
+    if i < 0 { return; }
+    let incomplete = r.early || r.write_err != ERR_NONE;
+    if incomplete { c.conns[i].must_close = true; }
+    let werr = r.write_err;
+    let reused = r.reused;
+    read_head(c, i, r);
+    r.reused = reused;
+    if r.err != ERR_NONE {
+        conn_close(c, i);
+        r.conn = -1;
+        // No response to show for a body that could not be sent: that error.
+        if werr != ERR_NONE { r.err = werr; }
+    }
+}
+
 // The response head (1xx ones skipped). On an error, status -1 says
 // nothing at all came (the request may be retried).
-fn read_head(c: Client&, i: i64, u: const Url&) -> Response {
-    var r = empty_response(ERR_NONE);
-    r.data.append(url_text(u));
-    r.url = span(0, r.data.len);
+fn read_head(c: Client&, i: i64, r: Response&) {
+    let url_t = copy_url_text(r);
+    reset_response(r, ERR_NONE);
+    set_url(r, url_t);
     var got_any = false;
     var eof = false;
     var trailer: u8[>..] = [];
@@ -1193,26 +1433,26 @@ fn read_head(c: Client&, i: i64, u: const Url&) -> Response {
             r.reused = pc.reused;
             if pc.is_tls { r.tls_version = tls::version(pc.tc); r.tls_resumed = tls::resumed(pc.tc); }
             r.body_done = client_idle(pc.hc) || client_closed(pc.hc);
-            if h.status == 101 { r.err = ERR_PROTOCOL; r.status = 0; conn_close(c, i); r.conn = -1; return r; }
+            if h.status == 101 { r.err = ERR_PROTOCOL; r.status = 0; conn_close(c, i); r.conn = -1; return; }
             if r.body_done { finish_body(c, r); }
-            return r;
+            return;
         }
-        if ev.kind == EV_ERROR { r.err = ERR_PROTOCOL; return r; }
-        if ev.kind != EV_NEED_MORE { r.err = ERR_PROTOCOL; return r; }
+        if ev.kind == EV_ERROR { r.err = ERR_PROTOCOL; return; }
+        if ev.kind != EV_NEED_MORE { r.err = ERR_PROTOCOL; return; }
         if eof {
             r.err = ERR_IO;
             if !got_any && c.buf.len == 0 { r.status = -1; }
-            return r;
+            return;
         }
         let n = conn_fill(c, i);
         if n < 0 {
             r.err = -n;
             if !got_any && c.buf.len == 0 && -n == ERR_IO { r.status = -1; }
-            return r;
+            return;
         }
         if n == 0 { eof = true; }
     }
-    return r;
+    return;
 }
 
 fn drop_front(b: u8[>..]&, n: i64) {
