@@ -46,6 +46,14 @@ def find_goose(arg):
     sys.exit("no goose compiler found: pass --goose or set GOOSE")
 
 
+skipped = []
+
+
+def skip(what):
+    skipped.append(what)
+    print(f"skip  {what}")
+
+
 def check(name, ok, detail=""):
     global passed
     if only and only not in name:
@@ -165,14 +173,17 @@ def h2_server_cases(port, tls, ca, gi):
     codes = out.decode().split()
     check(f"{tag}: curl, 20 requests in parallel on one connection",
           rc == 0 and sorted(codes[0::2]) == sorted(["200"] * 15 + ["404"] * 5) and sum(map(int, codes[1::2])) == 1, out[:300])
-    if shutil.which("nghttp"):
-        nopts = [] if tls else []
+    if not shutil.which("nghttp"):
+        skip(f"{tag}: nghttp not on PATH")
+    else:
         rc, out, err = run(["nghttp", "-n", "-s", "-m", "10", base + "/big.bin"])
         check(f"{tag}: nghttp, 10 GETs of 1 MiB at once", rc == 0 and out.count(b"/big.bin") >= 10 and b"200" in out,
               out[-300:] + err[-300:])
         rc, out, err = run(["nghttp", "-n", "-d", "-", base + "/echo"], data=big())
         check(f"{tag}: nghttp POST 1 MiB", rc == 0, err[-300:])
-    if shutil.which("h2load"):
+    if not shutil.which("h2load"):
+        skip(f"{tag}: h2load not on PATH")
+    else:
         rc, out, err = run(["h2load", "-n", "2000", "-c", "4", "-m", "25", base + "/index.html"], timeout=120)
         m = re.search(rb"requests: (\d+) total, \d+ started, (\d+) done, (\d+) succeeded, (\d+) failed, (\d+) errored", out)
         check(f"{tag}: h2load, 2000 requests over 4 connections, 25 streams each",
@@ -330,7 +341,7 @@ def nghttpd_cases(gh, tmp, ca, key):
     """goose-http against nghttpd with tiny flow-control windows (1 KiB a
     stream, 64 KiB the connection), over TLS and TCP."""
     if not shutil.which("nghttpd"):
-        check("nghttpd: installed", False, "not on PATH")
+        skip("nghttpd: not on PATH")
         return
     docs = os.path.join(tmp, "nghttpd-docs")
     os.makedirs(docs, exist_ok=True)
@@ -955,7 +966,7 @@ def main():
         for s in servers:
             s.stop()
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n{passed} passed, {len(failed)} failed")
+    print(f"\n{passed} passed, {len(failed)} failed" + (f", {len(skipped)} groups skipped (tools missing)" if skipped else ""))
     sys.exit(1 if failed else 0)
 
 
