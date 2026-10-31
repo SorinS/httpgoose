@@ -1,0 +1,132 @@
+# RFC 7541 Appendix C, as golang.org/x/net v0.58.0's hpack_test.go quotes it; scripts/gen_hpack_vectors.py
+series	4096	C.2.1
+block	400a637573746f6d2d6b65790d637573746f6d2d686561646572
+field	custom-key	custom-header	0
+table	custom-key	custom-header
+series	4096	C.2.2
+block	040c2f73616d706c652f70617468
+field	:path	/sample/path	0
+series	4096	C.2.3
+block	100870617373776f726406736563726574
+field	password	secret	1
+series	4096	C.2.4
+block	82
+field	:method	GET	0
+series	4096	C.3
+block	828684410f7777772e6578616d706c652e636f6d
+field	:method	GET	0
+field	:scheme	http	0
+field	:path	/	0
+field	:authority	www.example.com	0
+table	:authority	www.example.com
+size	57
+block	828684be58086e6f2d6361636865
+field	:method	GET	0
+field	:scheme	http	0
+field	:path	/	0
+field	:authority	www.example.com	0
+field	cache-control	no-cache	0
+table	cache-control	no-cache
+table	:authority	www.example.com
+size	110
+block	828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565
+field	:method	GET	0
+field	:scheme	https	0
+field	:path	/index.html	0
+field	:authority	www.example.com	0
+field	custom-key	custom-value	0
+table	custom-key	custom-value
+table	cache-control	no-cache
+table	:authority	www.example.com
+size	164
+series	4096	C.4
+block	828684418cf1e3c2e5f23a6ba0ab90f4ff
+field	:method	GET	0
+field	:scheme	http	0
+field	:path	/	0
+field	:authority	www.example.com	0
+table	:authority	www.example.com
+size	57
+block	828684be5886a8eb10649cbf
+field	:method	GET	0
+field	:scheme	http	0
+field	:path	/	0
+field	:authority	www.example.com	0
+field	cache-control	no-cache	0
+table	cache-control	no-cache
+table	:authority	www.example.com
+size	110
+block	828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf
+field	:method	GET	0
+field	:scheme	https	0
+field	:path	/index.html	0
+field	:authority	www.example.com	0
+field	custom-key	custom-value	0
+table	custom-key	custom-value
+table	cache-control	no-cache
+table	:authority	www.example.com
+size	164
+series	256	C.5
+block	4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d
+field	:status	302	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:21 GMT	0
+field	location	https://www.example.com	0
+table	location	https://www.example.com
+table	date	Mon, 21 Oct 2013 20:13:21 GMT
+table	cache-control	private
+table	:status	302
+size	222
+block	4803333037c1c0bf
+field	:status	307	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:21 GMT	0
+field	location	https://www.example.com	0
+table	:status	307
+table	location	https://www.example.com
+table	date	Mon, 21 Oct 2013 20:13:21 GMT
+table	cache-control	private
+size	222
+block	88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31
+field	:status	200	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:22 GMT	0
+field	location	https://www.example.com	0
+field	content-encoding	gzip	0
+field	set-cookie	foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1	0
+table	set-cookie	foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+table	content-encoding	gzip
+table	date	Mon, 21 Oct 2013 20:13:22 GMT
+size	215
+series	256	C.6
+block	488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3
+field	:status	302	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:21 GMT	0
+field	location	https://www.example.com	0
+table	location	https://www.example.com
+table	date	Mon, 21 Oct 2013 20:13:21 GMT
+table	cache-control	private
+table	:status	302
+size	222
+block	4883640effc1c0bf
+field	:status	307	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:21 GMT	0
+field	location	https://www.example.com	0
+table	:status	307
+table	location	https://www.example.com
+table	date	Mon, 21 Oct 2013 20:13:21 GMT
+table	cache-control	private
+size	222
+block	88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007
+field	:status	200	0
+field	cache-control	private	0
+field	date	Mon, 21 Oct 2013 20:13:22 GMT	0
+field	location	https://www.example.com	0
+field	content-encoding	gzip	0
+field	set-cookie	foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1	0
+table	set-cookie	foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+table	content-encoding	gzip
+table	date	Mon, 21 Oct 2013 20:13:22 GMT
+size	215
