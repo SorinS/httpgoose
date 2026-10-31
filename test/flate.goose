@@ -54,6 +54,40 @@ fn bad(name: const u8[:], format: u8, hex: const u8[:], want_err: i64) {
     }
 }
 
+// A gzip member whose FEXTRA, FNAME and FCOMMENT are far longer than what
+// the decoder keeps of its input (FLATE_PENDING): they are read as they
+// come, and FHCRC checks all of them.
+fn long_header() {
+    var m: u8[>..] = [];
+    m.append([0x1f, 0x8b, 8, 4 | 8 | 16 | 2, 0, 0, 0, 0, 0, 3]);
+    m.push(0x60);                       // XLEN 60000
+    m.push(0xea);
+    for k in 60000 { m.push(((k * 13) % 256) as! u8); }
+    for k in 10000 { m.push('n'); }
+    m.push(0);
+    for k in 5000 { m.push('c'); }
+    m.push(0);
+    let h = http::crc32(m) & 0xffff;
+    m.push((h & 0xff) as! u8);
+    m.push((h >> 8) as! u8);
+    // "hi" as a fixed-Huffman block, and its trailer.
+    m.append([0xcb, 0xc8, 0x04, 0x00]);
+    let c = http::crc32("hi");
+    for k in 4 { m.push(((c >> ((k * 8) as! u32)) & 0xff) as! u8); }
+    m.append([2, 0, 0, 0]);
+    for chunk in [1, 1000, 1 << 20] {
+        let out, e, done = decode(http::FLATE_GZIP, m, chunk);
+        if e != 0 || !done || out[..] != "hi" {
+            print("FAIL long header fields, chunk ", chunk, ": err ", e, " done ", done, " got '", out, "'");
+            failures++;
+        }
+    }
+    // A wrong FHCRC is caught after all that.
+    m[10 + 2 + 60000 + 10001 + 5001] ^= 1;     // the first byte of FHCRC
+    let out2, e2, done2 = decode(http::FLATE_GZIP, m, 777);
+    if e2 != http::FLATE_ERR_CHECK { print("FAIL long header, wrong FHCRC: err ", e2); failures++; }
+}
+
 fn main() {
     case("gzip with a name", http::FLATE_GZIP,
          "1f8b080800000000000368656c6c6f2e74787400cb48cdc9c9d75128cf2fca49e10200537424f40d000000", "hello, world\n");
@@ -77,6 +111,7 @@ fn main() {
     bad("block type 3", http::FLATE_ZLIB, "0700", http::FLATE_ERR_DATA);
     bad("stored nlen", http::FLATE_ZLIB, "010500fbff68656c6c6f", http::FLATE_ERR_DATA);
     bad("distance too far", http::FLATE_ZLIB, "030200", http::FLATE_ERR_DATA);
+    long_header();
     if http::crc32("The quick brown fox jumps over the lazy dog") != 0x414fa339 { print("FAIL crc32"); failures++; }
     if http::adler32_update(1, "Wikipedia") != 0x11e60398 { print("FAIL adler32"); failures++; }
     if failures > 0 { print(failures, " failures"); exit(1); }

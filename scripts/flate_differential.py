@@ -69,16 +69,20 @@ def raw_deflate(rng, data):
 def gzip_member(rng, data):
     flg = 0
     extra = b""
+    # Header fields long and short: the decoder reads them as they come,
+    # past what it keeps of the input.
+    def field_len():
+        return rng.choice([0, 1, 40, 3000, 70000])
     if rng.random() < 0.3:
         flg |= 4
-        x = rng.randbytes(rng.randrange(0, 40))
+        x = rng.randbytes(min(rng.choice([0, 1, 40, 3000, 65535]), 65535))
         extra += struct.pack("<H", len(x)) + x
     if rng.random() < 0.3:
         flg |= 8
-        extra += b"name.txt\x00"
+        extra += bytes(rng.randrange(1, 256) for _ in range(field_len())) + b"\x00"
     if rng.random() < 0.3:
         flg |= 16
-        extra += b"a comment\x00"
+        extra += bytes(rng.randrange(1, 256) for _ in range(field_len())) + b"\x00"
     head = b"\x1f\x8b\x08" + bytes([flg | (2 if rng.random() < 0.3 else 0)]) + b"\x00\x00\x00\x00\x00\x03" + extra
     if head[3] & 2:
         head += struct.pack("<H", zlib.crc32(head) & 0xffff)

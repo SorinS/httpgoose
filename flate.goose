@@ -10,7 +10,11 @@
 //   // at the body's end: http::inflate_done(d) says whether the stream was whole
 //
 // Huffman codes are decoded a bit at a time, as zlib's puff.c does: correct
-// first. Input that ends inside a symbol is kept until more comes.
+// first. Input that ends inside a symbol (or a block's header) is kept
+// until more comes, in a buffer of fixed size: input is taken a slice at a
+// time, and a gzip header's optional fields (FEXTRA up to 64 KiB, FNAME
+// and FCOMMENT of any length) are read as they come, as zlib reads them,
+// so a decoder is of fixed size (some 37 KB) and needs no more.
 
 namespace http;
 
@@ -36,6 +40,18 @@ let FS_FAILED: u8 = 6;
 
 let MAXBITS: i64 = 15;
 
+// The input kept: past a slice of what comes, the most a decoder can be
+// left waiting on is a dynamic block's header (under 600 bytes).
+let FLATE_PENDING: i64 = 2048;
+
+// A gzip header's parts, read as they come.
+let GH_FIXED: u8 = 0;
+let GH_XLEN: u8 = 1;
+let GH_EXTRA: u8 = 2;
+let GH_NAME: u8 = 3;
+let GH_COMMENT: u8 = 4;
+let GH_HCRC: u8 = 5;
+
 struct Huffman { count: i16[16], symbol: i16[288] }
 
 struct Inflate {
@@ -48,7 +64,11 @@ struct Inflate {
     window: u8[32768], wpos: i64, wfull: bool,
     crc: u32, adler: u32, size: u64,
     members: i64,                   // gzip members ended
-    pending: u8[>..],               // input not used yet, from pending[0] bit `bit`
+    gh: u8,                         // the part of a gzip header being read
+    gh_flags: u8,
+    gh_left: i64,                   // FEXTRA's bytes still to skip
+    gh_crc: u32,                    // CRC-32 of the header so far (for FHCRC)
+    pending: u8[..2048],            // input not used yet, from pending[0] bit `bit`
 }
 
 fn new_huffman() -> Huffman { Huffman { count: [0; 16], symbol: [0; 288] } }
@@ -57,7 +77,8 @@ fn new_inflate(format: u8) -> Inflate {
     Inflate {
         format: format, state: if format == FLATE_RAW { FS_BLOCK } else { FS_HEADER }, last: false, stored_left: 0,
         bit: 0, lencode: new_huffman(), distcode: new_huffman(), window: [0; 32768], wpos: 0, wfull: false,
-        crc: 0xffffffff, adler: 1, size: 0, members: 0, pending: [],
+        crc: 0xffffffff, adler: 1, size: 0, members: 0,
+        gh: GH_FIXED, gh_flags: 0, gh_left: 0, gh_crc: 0, pending: [],
     }
 }
 
@@ -317,45 +338,64 @@ fn codes(d: Inflate&, out: u8[>..]&) -> i64 {
 
 // gzip's member header (RFC 1952 §2.3): 1 when read, 0 for more input.
 fn gzip_header(d: Inflate&) -> i64 {
-    let m = d.pending[..];
-    if m.len < 10 { return 0; }
-    if m[0] != 0x1f || m[1] != 0x8b || m[2] != 8 { return FLATE_ERR_HEADER; }
-    let flg = m[3];
-    if (flg & 0xe0) != 0 { return FLATE_ERR_HEADER; }
-    var p = 10;
-    if (flg & 4) != 0 {                 // FEXTRA
-        if m.len < p + 2 { return 0; }
-        let xlen = m[p] as i64 | (m[p + 1] as i64) << 8;
-        p += 2 + xlen;
-        if m.len < p { return 0; }
+    while true {
+        let m = d.pending[..];
+        var used: i64 = 0;
+        let starting = d.gh == GH_FIXED;
+        if d.gh == GH_FIXED {
+            if m.len < 10 { return 0; }
+            if m[0] != 0x1f || m[1] != 0x8b || m[2] != 8 { return FLATE_ERR_HEADER; }
+            if (m[3] & 0xe0) != 0 { return FLATE_ERR_HEADER; }
+            d.gh_flags = m[3];
+            used = 10;
+            d.gh = GH_XLEN;
+        } else if d.gh == GH_XLEN {
+            if (d.gh_flags & 4) == 0 { d.gh = GH_NAME; continue; }      // FEXTRA
+            if m.len < 2 { return 0; }
+            d.gh_left = m[0] as i64 | (m[1] as i64) << 8;
+            used = 2;
+            d.gh = GH_EXTRA;
+        } else if d.gh == GH_EXTRA {
+            if d.gh_left > 0 && m.len == 0 { return 0; }
+            used = if m.len < d.gh_left { m.len } else { d.gh_left };
+            d.gh_left -= used;
+            if d.gh_left == 0 { d.gh = GH_NAME; }
+        } else if d.gh == GH_NAME || d.gh == GH_COMMENT {
+            let flag: u8 = if d.gh == GH_NAME { 8 } else { 16 };              // FNAME, FCOMMENT
+            if (d.gh_flags & flag) == 0 {
+                d.gh = if d.gh == GH_NAME { GH_COMMENT } else { GH_HCRC };
+                continue;
+            }
+            if m.len == 0 { return 0; }
+            let z = position(m, 0);
+            if z < 0 {
+                used = m.len;
+            } else {
+                used = z + 1;
+                d.gh = if d.gh == GH_NAME { GH_COMMENT } else { GH_HCRC };
+            }
+        } else {
+            if (d.gh_flags & 2) != 0 {                                      // FHCRC
+                if m.len < 2 { return 0; }
+                let c = (d.gh_crc ^ 0xffffffff) & 0xffff;
+                if c != (m[0] as u32 | (m[1] as u32) << 8) { return FLATE_ERR_CHECK; }
+                var b2 = Bits { pos: 2, bit: 0, ok: true };
+                commit(d, b2);
+            }
+            d.gh = GH_FIXED;
+            d.crc = 0xffffffff;
+            d.size = 0;
+            d.wpos = 0;
+            d.wfull = false;
+            return 1;
+        }
+        if used > 0 {
+            d.gh_crc = crc32_update(if starting { 0xffffffff } else { d.gh_crc }, m[..used]);
+            var b = Bits { pos: used, bit: 0, ok: true };
+            commit(d, b);
+        }
     }
-    if (flg & 8) != 0 {                 // FNAME
-        let z = position(m[p..], 0);
-        if z < 0 { return 0; }
-        p += z + 1;
-    }
-    if (flg & 16) != 0 {                // FCOMMENT
-        let z = position(m[p..], 0);
-        if z < 0 { return 0; }
-        p += z + 1;
-    }
-    var hcrc_at = -1;
-    if (flg & 2) != 0 {                 // FHCRC
-        if m.len < p + 2 { return 0; }
-        hcrc_at = p;
-        p += 2;
-    }
-    if hcrc_at >= 0 {
-        let c = crc32(m[..hcrc_at]) & 0xffff;
-        if c != (m[hcrc_at] as u32 | (m[hcrc_at + 1] as u32) << 8) { return FLATE_ERR_CHECK; }
-    }
-    var b = Bits { pos: p, bit: 0, ok: true };
-    commit(d, b);
-    d.crc = 0xffffffff;
-    d.size = 0;
-    d.wpos = 0;
-    d.wfull = false;
-    return 1;
+    return 0;
 }
 
 // zlib's header (RFC 1950 §2.2), or none for raw DEFLATE: 1 when read.
@@ -402,7 +442,23 @@ fn trailer(d: Inflate&) -> i64 {
 // (< 0, after which the decoder takes nothing more).
 fn inflate_feed(d: Inflate&, input: const u8[:], out: u8[>..]&) -> i64 {
     if d.state == FS_FAILED { return FLATE_ERR_DATA; }
-    d.pending.append(input);
+    var at = 0;
+    while true {
+        let room = FLATE_PENDING - d.pending.len;
+        let n = if input.len - at < room { input.len - at } else { room };
+        d.pending.append(input[at..at + n]);
+        at += n;
+        let r = inflate_run(d, out);
+        if r < 0 { return r; }
+        if at >= input.len { return 0; }
+        // No room, and nothing could be decoded from a full buffer.
+        if d.pending.len >= FLATE_PENDING { d.state = FS_FAILED; return FLATE_ERR_DATA; }
+    }
+    return 0;
+}
+
+// Decodes what d.pending holds: 0 when it needs more, or an error.
+fn inflate_run(d: Inflate&, out: u8[>..]&) -> i64 {
     while true {
         var r: i64 = 0;
         if d.state == FS_HEADER {
