@@ -147,6 +147,7 @@ python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
 python3 scripts/url_differential.py [--seed N] [--random N] [-v]
 python3 scripts/flate_differential.py [--seed N] [--count N] [-v]
 python3 scripts/httpnet_check.py [--cc CC | --msvc]   # src/httpnet.c alone, also on Windows
+python3 scripts/upfile_check.py [--cc CC | --msvc]    # tools/upfile.c (goose-http -T) alone, also on Windows
 python3 scripts/gen_cookie_vectors.py      # Go's cookiejar tables -> test/vectors/cookiejar*.txt
 python3 scripts/gen_proxy_vectors.py       # x/net's httpproxy tables -> test/vectors/proxy.txt
 python3 scripts/hpack_differential.py [--seed N] [--conns N] [-v]

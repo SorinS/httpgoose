@@ -17,11 +17,11 @@
 #  define open_ open
 #  define read_ read
 #  define close_ close
-#  include <stdio.h>
 #  define O_FLAGS O_RDONLY
 #endif
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
