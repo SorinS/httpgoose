@@ -535,7 +535,7 @@ fn finish_response(c: Client&, r: Response&, want_gzip: bool, redirects: i64) {
     if want_gzip && has_ce && eq_fold(ce, "gzip") && !r.body_done {
         drop_coding_fields(r);
         r.decode = true;
-        c.inflate = gzip_decoder();
+        r.inflate = inflate_slot(c);
     }
 }
 

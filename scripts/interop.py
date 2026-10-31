@@ -752,7 +752,7 @@ def main():
     servers = []
     try:
         tools = os.path.join(ROOT, "tools")
-        for src, exe in (("httpd.goose", "goose-httpd"), ("http.goose", "goose-http")):
+        for src, exe in (("httpd.goose", "goose-httpd"), ("http.goose", "goose-http"), ("clientcheck.goose", "clientcheck")):
             p = subprocess.run([goose, "build", "-o", os.path.join(tmp, exe), os.path.join(tools, src)],
                                capture_output=True, text=True)
             if p.returncode != 0:
@@ -805,6 +805,15 @@ def main():
         goose_client_cases(gh, g0.port, None, cert, "goose-http to go tcp")
         goose_client_cases(gh, g12.port, "1.2", cert, "goose-http to go 1.2")
         goose_client_cases(gh, g13.port, "1.3", cert, "goose-http to go 1.3")
+        # The client's API with several responses open at once.
+        cc = os.path.join(tmp, "clientcheck")
+        for tag, url, extra in (("tcp", f"http://127.0.0.1:{g0.port}", []),
+                                ("tls 1.3", f"https://localhost:{g13.port}", ["--cacert", cert])):
+            rc, out, err = run([cc, url, *extra], timeout=120)
+            for line in out.decode().splitlines():
+                check(f"client api {tag}: " + line.split(" ", 1)[1].split(":")[0], line.startswith("ok "), line)
+            if rc not in (0, 1) or not out:
+                check(f"client api {tag}: ran", False, err.decode()[:300])
         py = Server([sys.executable, "-c", PY10], r"listening (\d+)", "stdout")
         servers.append(py)
         rc, out, err = run([gh, f"http://127.0.0.1:{py.port}/", f"http://127.0.0.1:{py.port}/"])

@@ -15,9 +15,9 @@
 //       while http::read_body(c, r, body) > 0 {}
 //   }
 //
-// One response is read at a time: open the next after the body of the one
-// before has been read to its end or closed (close_body). The sockets are
-// in src/httpnet.c, built with programs that use this module.
+// Several responses may be open at once, each on its connection, and read
+// in any order. The sockets are in src/httpnet.c, built with programs
+// that use this module.
 
 namespace http;
 
@@ -59,7 +59,7 @@ let ERR_TOO_LARGE: i64 = 9;         // the body passed the client's max_body
 let ERR_REDIRECTS: i64 = 10;        // more redirects than max_redirects
 let ERR_PROXY: i64 = 11;            // the proxy refused the tunnel, or its answer was not HTTP
 let ERR_DECODE: i64 = 12;           // a gzip body that does not decode
-let ERR_STATE: i64 = 13;            // a response is still open on this client
+let ERR_STATE: i64 = 13;            // a call the response is not ready for (write_body after end_request, say)
 let ERR_AUTH: i64 = 14;             // (not returned: a 401 or 407 comes back as the response)
 
 fn client_error_text(e: i64) -> const u8[:] {
@@ -75,7 +75,7 @@ fn client_error_text(e: i64) -> const u8[:] {
     if e == ERR_REDIRECTS { return "too many redirects"; }
     if e == ERR_PROXY { return "the proxy failed"; }
     if e == ERR_DECODE { return "the body's content coding does not decode"; }
-    if e == ERR_STATE { return "a response is still open on this client"; }
+    if e == ERR_STATE { return "the request is not in a state for that"; }
     if e == ERR_AUTH { return "the credentials were refused"; }
     return "";
 }
@@ -118,6 +118,7 @@ fn client_options() -> ClientOptions {
 // A connection of the pool: in use, idle, or a free slot.
 struct PoolConn {
     used: bool,                     // the slot holds a connection
+    gen: i64,                       // which connection the slot holds (responses check it is still theirs)
     idle: bool,                     // in the pool, waiting for a request
     fd: i64,
     key: u8[..600],                 // what it reaches: scheme, host, port, and the proxy's
@@ -148,14 +149,17 @@ root struct Client {
     tlscfg: tls::ClientConfig = tls::client_config("", ""),
     conns: PoolConn[>..] = [],
     outer: OuterTls[>..] = [],
-    buf: u8[>..] = [],              // plaintext that has come and is not used yet
+    buf: u8[>..] = [],              // plaintext that has come on connection buf_owner and is not used yet
+    buf_owner: i64 = -1,
+    store: u8[>..] = [],            // the other connections' input not used yet: records of store_put
     raw: u8[>..] = [],              // a read from the socket
     mid: u8[>..] = [],              // an https proxy's plaintext: the tunnel's TLS records
     wire: u8[>..] = [],             // bytes to send
     wire2: u8[>..] = [],            // the same, through an https proxy's TLS
-    open: i64 = -1,                 // the slot a response is being read from, or -1
-    deadline: i64 = 0,              // clock_ns() the request must end by, or 0
-    inflate: Inflate = gzip_decoder(),
+    deadline: i64 = 0,              // clock_ns() the operation under way must end by, or 0 (its response's)
+    gen_seq: i64 = 0,
+    inflates: Inflate[>..] = [],    // gzip decoders, one a response that is decoded
+    inflate_used: bool[>..] = [],
     jar: Jar = new_jar(),
     psl: Psl = empty_psl(),
     user: u8[>..] = [],             // credentials for servers (set_credentials)
@@ -169,7 +173,8 @@ root struct Client {
     proxy_authz: u8[>..] = [],      // the Proxy-Authorization value to send, if any
     proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
     proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
-    pend: u8[>..] = [],             // a request's head and body not sent yet
+    pend: u8[>..] = [],             // a request's head and body not sent yet, on connection pend_owner
+    pend_owner: i64 = -1,
     sessions: u8[>..] = [],         // the TLS session cache: records of session_put
     digest_base: u8[>..] = [],      // the URL whose 401 the client's Digest answered (http.fetch), empty for none
     digest_params: u8[>..] = [],    // that challenge's params, answered again with digest_nc + 1
@@ -204,6 +209,9 @@ struct Response {
     length: i64,                    // the body's length as declared, -1 for chunks
     sent: i64,                      // what of it has gone
     write_err: i64,                 // the error sending it met, if any
+    deadline: i64,                  // clock_ns() it must end by (the client's timeout), or 0
+    gen: i64,                       // its connection's generation
+    inflate: i64,                   // its gzip decoder in c.inflates, or -1
     data: u8[>..],
 }
 
@@ -212,7 +220,7 @@ fn empty_response(err: i64) -> Response {
         err: err, status: 0, minor: 1, reason: empty_span(), url: empty_span(), fields: empty_span(),
         trailer: empty_span(), body: empty_span(), redirects: 0, conn: -1, body_done: true, decode: false,
         tls_version: 0, tls_resumed: false, reused: false,
-        sending: false, early: false, length: 0, sent: 0, write_err: 0, data: [],
+        sending: false, early: false, length: 0, sent: 0, write_err: 0, deadline: 0, gen: 0, inflate: -1, data: [],
     }
 }
 
@@ -238,6 +246,9 @@ fn reset_response(r: Response&, err: i64) {
     r.length = 0;
     r.sent = 0;
     r.write_err = 0;
+    r.deadline = 0;
+    r.gen = 0;
+    r.inflate = -1;
     r.data.clear();
 }
 
@@ -305,6 +316,108 @@ fn net_error(n: i64) -> i64 {
 }
 
 
+// --- Each connection's input ------------------------------------------------
+
+// What has come on a connection and is not used yet is in c.buf while that
+// connection is the one being read (c.buf_owner), else in c.store, as a
+// record: u32 slot, u32 stream (0 here), u8 kind, u32 length, the bytes.
+let K_IN: u8 = 1;
+
+fn store_find(c: const Client&, slot: i64, stream: i64, kind: u8) -> i64, i64 {
+    var p = 0;
+    while p + 13 <= c.store.len {
+        let n = rd_u(c.store, p + 9, 4) as! i64;
+        if (rd_u(c.store, p, 4) as! i64) == slot && (rd_u(c.store, p + 4, 4) as! i64) == stream && c.store[p + 8] == kind {
+            return p, n;
+        }
+        p += 13 + n;
+    }
+    return -1, 0;
+}
+
+fn store_put(c: Client&, slot: i64, stream: i64, kind: u8, data: const u8[:]) {
+    if data.len == 0 { return; }
+    let p, n = store_find(c, slot, stream, kind);
+    if p < 0 {
+        wr_u(c.store, slot as! u64, 4);
+        wr_u(c.store, stream as! u64, 4);
+        c.store.push(kind);
+        wr_u(c.store, data.len as! u64, 4);
+        c.store.append(data);
+        return;
+    }
+    var rest: u8[>..] = [];
+    rest.append(c.store[p + 13 + n..]);
+    c.store.resize(p + 13 + n);
+    c.store.append(data);
+    c.store.append(rest);
+    let total = n + data.len;
+    for k in 4 { c.store[p + 9 + k] = ((total >> ((3 - k) * 8)) & 0xff) as! u8; }
+}
+
+// Appends the record's bytes to out, and drops the record.
+fn store_take(c: Client&, slot: i64, stream: i64, kind: u8, out: u8[>..]&) {
+    let p, n = store_find(c, slot, stream, kind);
+    if p < 0 { return; }
+    out.append(c.store[p + 13..p + 13 + n]);
+    store_cut(c, p, 13 + n);
+}
+
+fn store_cut(c: Client&, p: i64, size: i64) {
+    var rest: u8[>..] = [];
+    rest.append(c.store[p + size..]);
+    c.store.resize(p);
+    c.store.append(rest);
+}
+
+// Drops every record of a slot.
+fn store_drop(c: Client&, slot: i64) {
+    var p = 0;
+    while p + 13 <= c.store.len {
+        let n = rd_u(c.store, p + 9, 4) as! i64;
+        if (rd_u(c.store, p, 4) as! i64) == slot { store_cut(c, p, 13 + n); } else { p += 13 + n; }
+    }
+}
+
+// Makes c.buf connection i's input.
+fn use_buf(c: Client&, i: i64) {
+    if c.buf_owner == i { return; }
+    if c.buf_owner >= 0 { store_put(c, c.buf_owner, 0, K_IN, c.buf); }
+    c.buf.clear();
+    store_take(c, i, 0, K_IN, c.buf);
+    c.buf_owner = i;
+}
+
+// What has come on connection i and is not used yet.
+fn leftover(c: const Client&, i: i64) -> i64 {
+    if c.buf_owner == i { return c.buf.len; }
+    let p, n = store_find(c, i, 0, K_IN);
+    return n;
+}
+
+// Sends the head held for another request (and what of its body there is).
+fn flush_pend(c: Client&) {
+    if c.pend.len == 0 || c.pend_owner < 0 { c.pend.clear(); return; }
+    let i = c.pend_owner;
+    if c.conns[i].used { conn_send(c, i, c.pend); }
+    c.pend.clear();
+}
+
+// A gzip decoder for a response.
+fn inflate_slot(c: Client&) -> i64 {
+    for k in c.inflate_used.len {
+        if !c.inflate_used[k] { c.inflate_used[k] = true; c.inflates[k] = gzip_decoder(); return k; }
+    }
+    c.inflates.push(gzip_decoder());
+    c.inflate_used.push(true);
+    return c.inflates.len - 1;
+}
+
+fn inflate_free(c: Client&, r: Response&) {
+    if r.inflate >= 0 && r.inflate < c.inflate_used.len { c.inflate_used[r.inflate] = false; }
+    r.inflate = -1;
+}
+
 // --- Connections -----------------------------------------------------------
 
 fn conn_close(c: Client&, i: i64) {
@@ -330,7 +443,9 @@ fn conn_close(c: Client&, i: i64) {
     pc.used = false;
     pc.idle = false;
     pc.fd = -1;
-    if c.open == i { c.open = -1; }
+    store_drop(c, i);
+    if c.buf_owner == i { c.buf.clear(); c.buf_owner = -1; }
+    if c.pend_owner == i { c.pend.clear(); c.pend_owner = -1; }
 }
 
 // Closes every idle connection (Go's CloseIdleConnections).
@@ -341,7 +456,7 @@ fn close_idle(c: Client&) {
 fn new_slot(c: Client&) -> i64 {
     for i in c.conns.len { if !c.conns[i].used { return i; } }
     c.conns.push(PoolConn {
-        used: false, idle: false, fd: -1, key: [], is_tls: false, reused: false, must_close: false, last_used: 0, server_name: [], sess_sig: 0,
+        used: false, gen: 0, idle: false, fd: -1, key: [], is_tls: false, reused: false, must_close: false, last_used: 0, server_name: [], sess_sig: 0,
         outer: -1, via_proxy: false, hc: client_conn(), tc: tls::client(c.tlscfg),
     });
     return c.conns.len - 1;
@@ -401,9 +516,8 @@ fn idle_drain(c: Client&, i: i64) -> bool {
 // or closed.
 fn conn_release(c: Client&, i: i64) {
     let pc: PoolConn& = c.conns[i];
-    if c.open == i { c.open = -1; }
     if !pc.used { return; }
-    if !client_idle(pc.hc) || pc.must_close || c.buf.len > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
+    if !client_idle(pc.hc) || pc.must_close || leftover(c, i) > 0 || c.mid.len > 0 || c.opt.max_idle <= 0 || c.opt.max_idle_per_host <= 0 {
         conn_close(c, i);
         return;
     }
@@ -628,6 +742,7 @@ fn conn_send(c: Client&, i: i64, data: const u8[:]) -> i64 {
 fn conn_fill(c: Client&, i: i64) -> i64 { conn_fill_t(c, i, c.opt.read_timeout_ms) }
 
 fn conn_fill_t(c: Client&, i: i64, timeout_op: i64) -> i64 {
+    use_buf(c, i);
     let pc: PoolConn& = c.conns[i];
     if !pc.is_tls { return link_read(c, i, c.buf, timeout_op); }
     while true {
@@ -676,6 +791,7 @@ fn conn_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
 }
 
 fn conn_handshake_run(c: Client&, i: i64, name: const u8[:]) -> i64 {
+    use_buf(c, i);
     let pc: PoolConn& = c.conns[i];
     while !tls::connected(pc.tc) {
         let t = wait_ms(c, c.opt.connect_timeout_ms);
@@ -762,6 +878,8 @@ fn conn_dial(c: Client&, i: i64, host: const u8[:], port: i64) -> i64 {
     if fd < 0 { return net_error(fd); }
     let pc: PoolConn& = c.conns[i];
     pc.used = true;
+    c.gen_seq++;
+    pc.gen = c.gen_seq;
     pc.idle = false;
     pc.fd = fd;
     pc.is_tls = false;
@@ -1188,6 +1306,7 @@ fn has_field_named(fields: const u8[:], name: const u8[:]) -> bool {
 // end_request reads a response if one came.
 fn write_body(c: Client&, r: Response&, data: const u8[:]) -> i64 {
     if !r.sending { return ERR_STATE; }
+    c.deadline = r.deadline;
     if r.length >= 0 && r.sent + data.len > r.length { return ERR_REQUEST; }
     send_body(c, r, data, false, "");
     return r.write_err;
@@ -1200,10 +1319,10 @@ fn write_body(c: Client&, r: Response&, data: const u8[:]) -> i64 {
 // closed.
 fn end_request(c: Client&, r: Response&, trailer: const u8[:]) -> i64 {
     if !r.sending { return ERR_STATE; }
+    c.deadline = r.deadline;
     if r.length >= 0 && r.sent != r.length && !r.early && r.write_err == ERR_NONE {
         let i = r.conn;
         conn_close(c, i);
-        c.pend.clear();
         let url_t = copy_url_text(r);
         reset_response(r, ERR_REQUEST);
         set_url(r, url_t);
@@ -1233,7 +1352,7 @@ fn set_url(r: Response&, t: const u8[:]) {
 fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:], length: i64, fresh: bool) -> Response {
     var r = empty_response(ERR_NONE);
     set_url(r, url_text(u));
-    if c.open >= 0 { r.err = ERR_STATE; return r; }
+    r.deadline = c.deadline;
     if url_check_http(u) != URL_OK { r.err = ERR_URL; return r; }
     var host: u8[>..] = [];
     let given, has_host = field_value(fields, "Host");
@@ -1241,9 +1360,13 @@ fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:],
     let i = conn_for(c, u, fresh);
     if i < 0 { r.err = -i; return r; }
     r.reused = c.conns[i].reused;
+    r.gen = c.conns[i].gen;
+    use_buf(c, i);
     c.buf.clear();
     c.mid.clear();
+    if c.pend_owner != i { flush_pend(c); }
     c.pend.clear();
+    c.pend_owner = i;
     var target: u8[>..] = [];
     var f = fields_without(fields, "Host");
     if c.conns[i].via_proxy {
@@ -1260,7 +1383,6 @@ fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:],
         r.err = ERR_REQUEST;
         return r;
     }
-    c.open = i;
     r.conn = i;
     r.sending = true;
     r.body_done = false;
@@ -1285,8 +1407,9 @@ fn begin_on(c: Client&, method: const u8[:], u: const Url&, fields: const u8[:],
 // Sends c.pend (the head, if it has not gone) and `data`, as a chunk if the
 // body is chunked, and with `last` the end: the last chunk and trailer.
 fn send_body(c: Client&, r: Response&, data: const u8[:], last: bool, trailer: const u8[:]) {
-    if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
     let i = r.conn;
+    if c.pend_owner != i { flush_pend(c); c.pend_owner = i; }
+    if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
     // A response that has come already ends the sending.
     if data.len > 0 && r.sent > 0 { poll_early(c, r); }
     if r.early || r.write_err != ERR_NONE { c.pend.clear(); return; }
@@ -1316,6 +1439,7 @@ fn poll_early(c: Client&, r: Response&) {
 // Takes interim responses from the front of c.buf; a final one there (or
 // one that does not parse) makes the request early.
 fn peek_head(c: Client&, r: Response&) -> bool {
+    use_buf(c, r.conn);
     let lim = default_limits();
     while c.buf.len > 0 {
         let h, n = parse_response(c.buf, lim);
@@ -1351,6 +1475,7 @@ fn wait_continue(c: Client&, r: Response&) {
 // Reads what has come on connection i into c.buf without waiting: 1, 0 if
 // the connection ended, or -ERR_*.
 fn conn_poll(c: Client&, i: i64) -> i64 {
+    use_buf(c, i);
     while httpnet_readable(c.conns[i].fd) != 0 {
         if !c.conns[i].is_tls {
             let n = link_read(c, i, c.buf, 1000);
@@ -1384,8 +1509,12 @@ fn finish_request(c: Client&, r: Response&) {
     if incomplete { c.conns[i].must_close = true; }
     let werr = r.write_err;
     let reused = r.reused;
+    let deadline = r.deadline;
+    let gen = r.gen;
     read_head(c, i, r);
     r.reused = reused;
+    r.deadline = deadline;
+    r.gen = gen;
     if r.err != ERR_NONE {
         conn_close(c, i);
         r.conn = -1;
@@ -1397,6 +1526,7 @@ fn finish_request(c: Client&, r: Response&) {
 // The response head (1xx ones skipped). On an error, status -1 says
 // nothing at all came (the request may be retried).
 fn read_head(c: Client&, i: i64, r: Response&) {
+    use_buf(c, i);
     let url_t = copy_url_text(r);
     reset_response(r, ERR_NONE);
     set_url(r, url_t);
@@ -1477,10 +1607,14 @@ fn finish_body(c: Client&, r: Response&) {
 fn read_wire_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
     if r.body_done || r.conn < 0 { return 0; }
     let i = r.conn;
+    // Its connection is gone (closed under it, the slot used again).
+    if !c.conns[i].used || c.conns[i].gen != r.gen { r.conn = -1; r.body_done = true; return -ERR_IO; }
+    c.deadline = r.deadline;
     var trailer: u8[>..] = [];
     var eof = false;
     while true {
         let before = out.len;
+        use_buf(c, i);
         let ev, h = client_read(c.conns[i].hc, c.buf, out, trailer);
         drop_front(c.buf, ev.used);
         if ev.kind == EV_END {
@@ -1518,24 +1652,32 @@ fn read_wire_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
 // closed then). The trailer, after a chunked body, goes to the response's
 // data.
 fn read_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
-    if !r.decode { return read_wire_body(c, r, out); }
+    if !r.decode || r.inflate < 0 { return read_wire_body(c, r, out); }
     var wire: u8[>..] = [];
+    let k = r.inflate;
     while true {
         if r.body_done {
-            if !inflate_done(c.inflate) { return -ERR_DECODE; }
+            let whole = inflate_done(c.inflates[k]);
+            inflate_free(c, r);
+            if !whole { return -ERR_DECODE; }
             return 0;
         }
         wire.clear();
         let n = read_wire_body(c, r, wire);
-        if n < 0 { return n; }
+        if n < 0 { inflate_free(c, r); return n; }
         let before = out.len;
-        if inflate_feed(c.inflate, wire, out) != 0 {
+        if inflate_feed(c.inflates[k], wire, out) != 0 {
             if r.conn >= 0 { conn_close(c, r.conn); r.conn = -1; }
             r.body_done = true;
+            inflate_free(c, r);
             return -ERR_DECODE;
         }
         // The body ended: the gzip stream must have ended whole with it.
-        if r.body_done && !inflate_done(c.inflate) { return -ERR_DECODE; }
+        if r.body_done {
+            let whole = inflate_done(c.inflates[k]);
+            inflate_free(c, r);
+            if !whole { return -ERR_DECODE; }
+        }
         if out.len > before { return out.len - before; }
         if r.body_done { return 0; }
     }
@@ -1565,7 +1707,9 @@ fn append_trailer(data: u8[>..]&, trailer: const u8[:]) {
 // small body is already here or comes at once (Go reads up to 2 KB of it
 // to keep the connection).
 fn close_body(c: Client&, r: Response&) {
+    inflate_free(c, r);
     if r.body_done || r.conn < 0 { r.body_done = true; return; }
+    if !c.conns[r.conn].used || c.conns[r.conn].gen != r.gen { r.conn = -1; r.body_done = true; return; }
     var sink: u8[>..] = [];
     var rounds = 0;
     while !r.body_done && sink.len <= 2048 && rounds < 4 {
@@ -1589,7 +1733,7 @@ fn read_all(c: Client&, r: Response&) -> i64 {
         if n < 0 { r.err = -n; return -n; }
         if body.len > c.opt.max_body { close_body(c, r); r.err = ERR_TOO_LARGE; return ERR_TOO_LARGE; }
     }
-    if r.decode && !inflate_done(c.inflate) { r.err = ERR_DECODE; return ERR_DECODE; }
+    // (read_body found any gzip stream that did not end whole.)
     // The body goes before the trailer, which read_body put at the end.
     var t: u8[>..] = [];
     let had_trailer = span_len(r.trailer) > 0;
