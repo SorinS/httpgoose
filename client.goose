@@ -168,6 +168,11 @@ root struct Client {
     proxy_status: i64 = 0,          // a proxy's answer to CONNECT that was not 2xx
     proxy_fields: u8[>..] = [],     // and its field lines (Proxy-Authenticate)
     sessions: u8[>..] = [],         // the TLS session cache: records of session_put
+    digest_base: u8[>..] = [],      // the URL whose 401 the client's Digest answered (http.fetch), empty for none
+    digest_params: u8[>..] = [],    // that challenge's params, answered again with digest_nc + 1
+    digest_user: u8[>..] = [],
+    digest_password: u8[>..] = [],
+    digest_nc: i64 = 0,
     session_seq: i64 = 0,
 }
 

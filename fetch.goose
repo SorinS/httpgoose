@@ -168,8 +168,10 @@ fn has_field(fields: const u8[:], name: const u8[:]) -> bool {
 
 // The Authorization value answering a challenge with the given credentials:
 // Digest if offered and allowed, else Basic if allowed. Empty if none fits.
+// The Digest challenge's params answered go to `chosen`.
 fn answer_challenge(fields: const u8[:], field: const u8[:], user: const u8[:], password: const u8[:], mode: u8,
-                    method: const u8[:], target: const u8[:], body: const u8[:]) -> u8[>..] {
+                    method: const u8[:], target: const u8[:], body: const u8[:], chosen: u8[>..]&) -> u8[>..] {
+    chosen.clear();
     var digest: u8[>..] = [];
     var has_digest = false;
     var has_basic = false;
@@ -179,6 +181,7 @@ fn answer_challenge(fields: const u8[:], field: const u8[:], user: const u8[:], 
                 var d: u8[>..] = [];
                 if digest_credentials(d, params, user, password, method, target, body, 1, "") {
                     digest.append(d);
+                    chosen.append(params);
                     has_digest = true;
                 }
             } else if eq_fold(scheme, "Basic") {
@@ -188,8 +191,49 @@ fn answer_challenge(fields: const u8[:], field: const u8[:], user: const u8[:], 
     };
     var out: u8[>..] = [];
     if has_digest && (mode == AUTH_ANY || mode == AUTH_DIGEST) { out.append(digest); }
-    else if has_basic && (mode == AUTH_ANY || mode == AUTH_BASIC) { basic_credentials(out, user, password); }
+    else if has_basic && (mode == AUTH_ANY || mode == AUTH_BASIC) { basic_credentials(out, user, password); chosen.clear(); }
+    else { chosen.clear(); }
     return out;
+}
+
+// Whether a URL is in the protection space of the Digest challenge the
+// client answered (RFC 7616 §3.3): the URIs its domain param lists (a
+// prefix of the path, on the same origin), else the whole origin.
+fn in_digest_space(c: const Client&, u: const Url&) -> bool {
+    if c.digest_base.len == 0 { return false; }
+    let base, be = url_parse(c.digest_base);
+    if be != URL_OK { return false; }
+    var here: u8[>..] = [];
+    if !origin_key(u, here) { return false; }
+    let dom, has_dom = auth_param(c.digest_params, "domain");
+    if !has_dom || trim_ows(dom).len == 0 {
+        var there: u8[>..] = [];
+        return origin_key(base, there) && here[..] == there[..];
+    }
+    var hit = false;
+    each_split(dom, ' ') {
+        if it.len > 0 && !hit {
+            let d, de = url_resolve(base, it);
+            var there: u8[>..] = [];
+            if de == URL_OK && origin_key(d, there) && here[..] == there[..] {
+                let dp = url_path(d);
+                let up = url_path(u);
+                // "/a" covers "/a" and what is under it, "/a/" what is under it.
+                if dp.len == 0 || (starts_with(up, dp) && (up.len == dp.len || dp[dp.len - 1] == '/' || up[dp.len] == '/')) {
+                    hit = true;
+                }
+            }
+        }
+    };
+    return hit;
+}
+
+fn forget_digest(c: Client&) {
+    c.digest_base.clear();
+    c.digest_params.clear();
+    c.digest_user.clear();
+    c.digest_password.clear();
+    c.digest_nc = 0;
 }
 
 // The proxy's credentials (its URL's userinfo), for a URL.
@@ -263,9 +307,30 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
         }
         let creds_here = c.user.len > 0 && same_site_for_credentials(u0, cur);
         let bearer_here = c.bearer.len > 0 && same_site_for_credentials(u0, cur);
+        // The credentials for this URL, if there are any.
+        var user: u8[>..] = [];
+        var pass: u8[>..] = [];
+        var have = false;
+        var mode = c.opt.auth;
+        if cur.has_user { user.append(url_username(cur)); pass.append(url_password(cur)); have = true; mode = AUTH_ANY; }
+        else if creds_here { user.append(c.user); pass.append(c.password); have = true; }
+        var sent_digest = false;
         if authz.len > 0 {
             remove_field(f, "Authorization");
             add_field(f, "Authorization", authz);
+        } else if !has_field(f, "Authorization") && have && mode != AUTH_BASIC && in_digest_space(c, cur)
+                  && user[..] == c.digest_user[..] && pass[..] == c.digest_password[..] {
+            // The challenge answered before, again with the next nc (RFC
+            // 7616 §3.4), so no 401 comes first.
+            var target: u8[>..] = [];
+            request_target(cur, target);
+            var d: u8[>..] = [];
+            if digest_credentials(d, c.digest_params, user, pass, method, target, if include_body { body } else { "" },
+                                  c.digest_nc + 1, "") {
+                c.digest_nc++;
+                add_field(f, "Authorization", d);
+                sent_digest = true;
+            }
         } else if !has_field(f, "Authorization") {
             if cur.has_user {
                 var b: u8[>..] = [];
@@ -308,7 +373,8 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
             if has_pcred {
                 var at: u8[>..] = [];
                 host_port_text(cur, at);
-                let a = answer_challenge(c.proxy_fields, "Proxy-Authenticate", pu_user, pu_pass, AUTH_ANY, "CONNECT", at, "");
+                var chosen: u8[>..] = [];
+                let a = answer_challenge(c.proxy_fields, "Proxy-Authenticate", pu_user, pu_pass, AUTH_ANY, "CONNECT", at, "", chosen);
                 if a.len > 0 && a[..] != c.proxy_authz[..] {
                     c.proxy_authz.clear();
                     c.proxy_authz.append(a);
@@ -326,19 +392,17 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
             let now = wall_ms();
             each_field(response_fields(r), "Set-Cookie") { v => jar_set_cookie(c.jar, c.psl, cur, v, now); };
         }
+        // A Digest answer refused: the challenge is not answered again
+        // unasked.
+        if r.status == 401 && auth_tried && c.digest_params.len > 0 { forget_digest(c); }
         // 401 and 407 answered once a hop, with the credentials there are.
         if r.status == 401 && !auth_tried {
-            var user: u8[>..] = [];
-            var pass: u8[>..] = [];
-            var have = false;
-            var mode = c.opt.auth;
-            if cur.has_user { user.append(url_username(cur)); pass.append(url_password(cur)); have = true; mode = AUTH_ANY; }
-            else if creds_here { user.append(c.user); pass.append(c.password); have = true; }
             if have {
                 var target: u8[>..] = [];
                 request_target(cur, target);
+                var chosen: u8[>..] = [];
                 let a = answer_challenge(response_fields(r), "WWW-Authenticate", user, pass, mode, method,
-                                         target, if include_body { body } else { "" });
+                                         target, if include_body { body } else { "" }, chosen);
                 // An answer the same as what was sent (Basic at once, a server
                 // that asks for Basic again) would get the same 401.
                 let sent, had = field_value(f, "Authorization");
@@ -347,17 +411,29 @@ fn fetch(c: Client&, method0: const u8[:], url_text: const u8[:], fields: const 
                     authz.clear();
                     authz.append(a);
                     auth_tried = true;
+                    forget_digest(c);
+                    if chosen.len > 0 {
+                        // Kept to answer this protection space's next
+                        // requests at once.
+                        c.digest_base.append(http::url_text(cur));
+                        c.digest_params.append(chosen);
+                        c.digest_user.append(user);
+                        c.digest_password.append(pass);
+                        c.digest_nc = 1;
+                    }
                     continue;
                 }
             }
+            if sent_digest { forget_digest(c); }
         }
         if r.status == 407 && !proxy_tried {
             let pu_user, pu_pass, has_pcred = proxy_userinfo(c, cur);
             if has_pcred {
                 var target: u8[>..] = [];
                 absolute_target(cur, target);
+                var chosen: u8[>..] = [];
                 let a = answer_challenge(response_fields(r), "Proxy-Authenticate", pu_user, pu_pass, AUTH_ANY, method,
-                                         target, if include_body { body } else { "" });
+                                         target, if include_body { body } else { "" }, chosen);
                 if a.len > 0 && a[..] != c.proxy_authz[..] {
                     close_body(c, r);
                     c.proxy_authz.clear();

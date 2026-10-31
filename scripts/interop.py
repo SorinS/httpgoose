@@ -237,7 +237,7 @@ def goose_client_cases(gh, port, tls, ca, tag):
 
 
 DIGEST = r"""
-import hashlib, http.server, re, sys
+import hashlib, http.server, re, secrets, sys
 USER, PASSWORD, REALM = "Mufasa", "Circle of Life", "digest@test"
 NONCE, OPAQUE = "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", "FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"
 ALGS = {"md5": ("MD5", "md5"), "sha256": ("SHA-256", "sha256"), "sha256-sess": ("SHA-256-sess", "sha256"),
@@ -249,12 +249,32 @@ def params(v):
     for m in re.finditer(r'([A-Za-z0-9*-]+)\s*=\s*("((?:[^"\\]|\\.)*)"|[^,\s]+)', v):
         out[m.group(1).lower()] = re.sub(r'\\(.)', r'\1', m.group(3)) if m.group(3) is not None else m.group(2)
     return out
+# What the server saw since /digest/stats was last read: 401s sent, and
+# the nc values taken. Each 401 has a fresh nonce, and nc must grow with
+# each request on a nonce (RFC 7616 §3.4). /digest/stale/* changes its
+# nonce after every two requests it takes, answering a request on the old
+# one with stale=true; /digest/dom/* names /digest/dom/ as its protection
+# space (the domain param).
+STATS = {"401": 0, "nc": []}
+LAST_NC = {}
+ISSUED = set()
+STALE = {"gen": 0, "uses": 0}
 class D(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def handle_any(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+        if self.path == "/digest/stats":
+            out = f"401 {STATS['401']} nc {','.join(STATS['nc'])}".encode()
+            STATS["401"], STATS["nc"] = 0, []
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         kind = self.path.rsplit("/", 1)[-1]
+        stale_kind = self.path.startswith("/digest/stale/")
+        nonce = f"rotating-{STALE['gen']}" if stale_kind else None
         name, alg = ALGS.get(kind, ALGS["sha256"])
         qop = "auth-int" if kind == "authint" else "auth"
         a = self.headers.get("Authorization", "")
@@ -266,24 +286,51 @@ class D(http.server.BaseHTTPRequestHandler):
                 ok_user = user == H(alg, USER + ":" + REALM) and p.get("userhash") == "true"
             else:
                 ok_user = user == USER
+            got_nonce = p.get("nonce", "")
             ha1 = H(alg, USER + ":" + REALM + ":" + PASSWORD)
             if name.endswith("-sess"):
-                ha1 = H(alg, ha1 + ":" + NONCE + ":" + p.get("cnonce", ""))
+                ha1 = H(alg, ha1 + ":" + got_nonce + ":" + p.get("cnonce", ""))
             a2 = self.command + ":" + p.get("uri", "")
             if qop == "auth-int":
                 a2 += ":" + hashlib.new(alg, body).hexdigest()
-            want = H(alg, ":".join([ha1, NONCE, p.get("nc", ""), p.get("cnonce", ""), qop, H(alg, a2)]))
-            ok = (ok_user and p.get("nonce") == NONCE and p.get("realm") == REALM and p.get("qop") == qop and
+            want = H(alg, ":".join([ha1, got_nonce, p.get("nc", ""), p.get("cnonce", ""), qop, H(alg, a2)]))
+            ok = (ok_user and p.get("realm") == REALM and p.get("qop") == qop and
                   p.get("opaque") == OPAQUE and p.get("uri") == self.path and p.get("response") == want)
+            try:
+                nc = int(p.get("nc", ""), 16)
+            except ValueError:
+                nc = 0
+            if ok and nc <= LAST_NC.get(got_nonce, 0):
+                ok = False                      # a replayed nc
+            if ok:
+                LAST_NC[got_nonce] = nc
+                STATS["nc"].append(str(nc))
+            stale = ok and stale_kind and got_nonce != nonce and got_nonce.startswith("rotating-")
+            if (stale_kind and got_nonce != nonce) or (not stale_kind and got_nonce not in ISSUED):
+                ok = False
+            if ok and stale_kind:
+                STALE["uses"] += 1
+                if STALE["uses"] == 2:
+                    STALE["gen"], STALE["uses"] = STALE["gen"] + 1, 0
+        else:
+            stale = False
         if ok:
             out = b"digest ok"
             self.send_response(200)
         else:
             out = b"digest wanted"
+            STATS["401"] += 1
+            if nonce is None:
+                nonce = secrets.token_hex(16)
+                ISSUED.add(nonce)
             self.send_response(401)
-            ch = f'Digest realm="{REALM}", qop="{qop}", algorithm={name}, nonce="{NONCE}", opaque="{OPAQUE}"'
+            ch = f'Digest realm="{REALM}", qop="{qop}", algorithm={name}, nonce="{nonce}", opaque="{OPAQUE}"'
             if kind == "userhash":
                 ch += ", userhash=true"
+            if stale:
+                ch += ", stale=true"
+            if self.path.startswith("/digest/dom/"):
+                ch += ', domain="/digest/dom/"'
             self.send_header("WWW-Authenticate", 'Basic realm="nope"')
             self.send_header("WWW-Authenticate", ch)
         self.send_header("Content-Length", str(len(out)))
@@ -389,6 +436,34 @@ def fetch_cases(gh, gi, cert, g0, g13, dg, env_base):
     check("auth: --anyauth takes Digest over Basic", rc == 0 and out == b"digest ok", out[:100])
     rc, out, err = gx("--digest", "-u", "Mufasa:wrong", f"{dbase}/sha256")
     check("auth: Digest refused exits 1", rc == 1, out[:100])
+    # The challenge answered again with the next nc, so no 401 comes first
+    # (RFC 7616 §3.4). curl 8 answers a new 401 for each request instead.
+    cred = "Mufasa:Circle of Life"
+    def stats():
+        return gx(f"{dbase}/stats")[1]
+    stats()
+    u = f"{dbase}/sha256"
+    rc, out, err = gx("--digest", "-u", cred, u, u, u)
+    st = stats()
+    check("auth: Digest's next requests answered at once, nc 1, 2, 3",
+          rc == 0 and out == b"digest ok" * 3 and st == b"401 1 nc 1,2,3", st)
+    us = f"{dbase}/stale/sha256"
+    rc, out, err = gx("--digest", "-u", cred, us, us, us, us)
+    st = stats()
+    check("auth: Digest stale=true answered with the new nonce", rc == 0 and out == b"digest ok" * 4 and
+          st == b"401 2 nc 1,2,3,1,2", st)
+    ud = f"{dbase}/dom/sha256"
+    rc, out, err = gx("--digest", "-u", cred, ud, ud, f"http://127.0.0.1:{dg}/other/sha256")
+    st = stats()
+    check("auth: Digest's domain param bounds the protection space", rc == 0 and out == b"digest ok" * 3 and
+          st == b"401 2 nc 1,2,1", st)
+    rc, out, err = gx("--digest", "-u", cred, u, f"{dbase}/md5")
+    st = stats()
+    check("auth: Digest's algorithm comes from each challenge", rc == 0 and out == b"digest ok" * 2 and
+          st == b"401 2 nc 1,1", st)
+    rc, out, err = gx("--basic", "-u", cred, u, u)
+    st = stats()
+    check("auth: --basic answers no Digest", rc == 1 and st == b"401 2 nc ", st)
 
     # gzip.
     rc, out, err = gx("--compressed", f"{plain}/gzip")

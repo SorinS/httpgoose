@@ -13,7 +13,7 @@ writes byte strings, and the caller owns the sockets.
 | `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
 | `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
 | `http.client` | The I/O: a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, bodies read whole or as a stream; HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
-| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401, Digest, Bearer, a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch` |
+| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch` |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
@@ -126,7 +126,6 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
 - One response is read at a time per `Client`.
 - `Client` is a `root struct`, so it can't be returned from a function or
   kept inside another struct.
-- Digest's `nc` is always 1, so each request answers a fresh challenge.
 
 ## Tests
 
