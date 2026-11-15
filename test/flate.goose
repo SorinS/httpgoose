@@ -4,6 +4,12 @@
 
 import std;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.url;
 import http.flate;
 
@@ -88,7 +94,62 @@ fn long_header() {
     if e2 != http::FLATE_ERR_CHECK { print("FAIL long header, wrong FHCRC: err ", e2); failures++; }
 }
 
+// Bits for a DEFLATE stream, least significant first; Huffman codes go
+// most significant bit first (RFC 1951 §3.1.1).
+struct BitOut { n: i64, bytes: u8[>..] }
+
+fn put_bits(w: BitOut&, v: i64, n: i64) {
+    for i in n {
+        if w.n % 8 == 0 { w.bytes.push(0); }
+        if (v >> i) & 1 != 0 { w.bytes[w.bytes.len - 1] |= (1 << (w.n % 8)) as! u8; }
+        w.n++;
+    }
+}
+
+fn put_code(w: BitOut&, code: i64, n: i64) { for i in n { put_bits(w, (code >> (n - 1 - i)) & 1, 1); } }
+
+// A bomb: one fixed-Huffman block, a 0 byte and `matches` copies of 258
+// bytes at distance 1, some 13 bits each.
+fn bomb(matches: i64) -> u8[>..] {
+    var w = BitOut { n: 0, bytes: [] };
+    put_bits(w, 1, 1);                 // BFINAL
+    put_bits(w, 1, 2);                 // fixed Huffman codes
+    put_code(w, 0x30, 8);              // the literal 0
+    for i in matches {
+        put_code(w, 0xc5, 8);          // length 258 (symbol 285)
+        put_code(w, 0, 5);             // distance 1
+    }
+    put_code(w, 0, 7);                 // end of block
+    return copy(w.bytes);
+}
+
+// A limit on the output stops a bomb as soon as it is passed; without
+// one it decodes whole.
+fn limits() {
+    let b = bomb(4000);
+    var d = http::new_inflate(http::FLATE_RAW);
+    var out: u8[>..] = [];
+    let e = http::inflate_feed(d, b, out, 100000);
+    if e != http::FLATE_ERR_LIMIT || out.len > 100000 + 258 {
+        print("FAIL limit: err ", e, ", ", out.len, " bytes");
+        failures++;
+    }
+    var d2 = http::new_inflate(http::FLATE_RAW);
+    var all: u8[>..] = [];
+    let e2 = http::inflate_feed(d2, b, all);
+    if e2 != 0 || !http::inflate_done(d2) || all.len != 1 + 258 * 4000 {
+        print("FAIL no limit: err ", e2, ", ", all.len, " bytes");
+        failures++;
+    }
+    // A limit the output stays within changes nothing.
+    var d3 = http::new_inflate(http::FLATE_RAW);
+    var within: u8[>..] = [];
+    let e3 = http::inflate_feed(d3, b, within, 1 + 258 * 4000);
+    if e3 != 0 || !http::inflate_done(d3) || within != all { print("FAIL within the limit: err ", e3); failures++; }
+}
+
 fn main() {
+    limits();
     case("gzip with a name", http::FLATE_GZIP,
          "1f8b080800000000000368656c6c6f2e74787400cb48cdc9c9d75128cf2fca49e10200537424f40d000000", "hello, world\n");
     case("gzip empty", http::FLATE_GZIP, "1f8b080000000000000303000000000000000000", "");

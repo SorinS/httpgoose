@@ -6,6 +6,12 @@
 
 import std;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.conn1;
 
 var checks = 0;
@@ -17,7 +23,8 @@ fn check(what: const u8[:], ok: bool) {
 }
 
 // A server fed `input`: the events in order, as letters (R request, B body,
-// E end, W waiting, N need more, X error), and the request targets.
+// E end, W waiting, N need more, C closed, X error), and the request
+// targets.
 struct Run { events: u8[..64], targets: u8[..512] }
 
 fn letter(k: u8) -> u8 {
@@ -26,10 +33,11 @@ fn letter(k: u8) -> u8 {
     if k == http::EV_END { return 'E'; }
     if k == http::EV_WAIT { return 'W'; }
     if k == http::EV_NEED_MORE { return 'N'; }
+    if k == http::EV_CLOSED { return 'C'; }
     return 'X';
 }
 
-// Reads until the server needs more, waits or fails.
+// Reads until the server needs more, waits, fails or is closed.
 fn drain(c: http::ServerConn&, buf: u8[>..]&, body: u8[>..]&, trailer: u8[>..]&, out: u8[>..]&, r: Run&) {
     loop {
         let ev, h = http::server_read(c, buf, body, trailer, out);
@@ -39,7 +47,7 @@ fn drain(c: http::ServerConn&, buf: u8[>..]&, body: u8[>..]&, trailer: u8[>..]&,
             if r.targets.len < r.targets.cap { r.targets.push(' '); }
         }
         drop(buf, ev.used);
-        if ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR { return; }
+        if ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR || ev.kind == http::EV_CLOSED { return; }
     }
 }
 
@@ -62,14 +70,14 @@ fn pipelining() {
     var out: u8[>..] = [];
     var r = new_run();
     drain(c, buf, body, trailer, out, r);
-    check("the first request, then waiting", r.events == "RW" && r.targets == "/one ");
+    check("the first request, then waiting", r.events == "REW" && r.targets == "/one ");
     check("the second not read yet", buf == "GET /two HTTP/1.1\r\nHost: a\r\n\r\n");
     check("respond", http::server_respond(c, 200, "", 3, out) && http::server_body(c, "one", out) && http::server_end(c, "", out));
     check("first response", out == "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none");
     check("still open", !http::closing(c));
     var r2 = new_run();
     drain(c, buf, body, trailer, out, r2);
-    check("the second request after the first response", r2.events == "RW" && r2.targets == "/two ");
+    check("the second request after the first response", r2.events == "REW" && r2.targets == "/two ");
     out.clear();
     check("a second response", http::server_respond(c, 404, "", 0, out) && http::server_end(c, "", out));
     check("its bytes", out == "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -77,6 +85,51 @@ fn pipelining() {
     drain(c, buf, body, trailer, out, r3);
     check("then nothing", r3.events == "N" && !http::closing(c));
     check("no second respond to one request", !http::server_respond(c, 200, "", 0, out));
+}
+
+// Every request ends with END, one without a body too; a connection read
+// after it closed says CLOSED.
+fn ends_and_close() {
+    var c = http::server_conn(http::server_options());
+    var buf: u8[>..] = [];
+    buf.append("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    var body: u8[>..] = [];
+    var trailer: u8[>..] = [];
+    var out: u8[>..] = [];
+    var r = new_run();
+    drain(c, buf, body, trailer, out, r);
+    check("no body: REQUEST, then END", r.events == "REW" && buf.len == 0);
+    check("answered", http::server_respond(c, 200, "", 0, out) && http::server_end(c, "", out) && http::closing(c));
+    var r2 = new_run();
+    drain(c, buf, body, trailer, out, r2);
+    check("after Connection: close, closed", r2.events == "C");
+    // Answered at REQUEST already: that request's END is not reported.
+    var c2 = http::server_conn(http::server_options());
+    var b2: u8[>..] = [];
+    b2.append("GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n");
+    var o2: u8[>..] = [];
+    let ev, h = http::server_read(c2, b2, body, trailer, o2);
+    drop(b2, ev.used);
+    check("complete at REQUEST", ev.kind == http::EV_REQUEST && http::request_complete(c2));
+    check("answered at REQUEST", http::server_respond(c2, 204, "", 0, o2) && http::server_end(c2, "", o2));
+    var r3 = new_run();
+    drain(c2, b2, body, trailer, o2, r3);
+    check("then the next request, no END before it", r3.events == "REW" && r3.targets == "/b ");
+    // With a body, the END after it, and nothing more.
+    var c3 = http::server_conn(http::server_options());
+    var b3: u8[>..] = [];
+    b3.append("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi");
+    var r4 = new_run();
+    drain(c3, b3, body, trailer, o2, r4);
+    check("a body: REQUEST, END", r4.events == "REW");
+    // A client read after the close.
+    var cl = http::client_conn();
+    var req: u8[>..] = [];
+    http::client_request(cl, "GET", "/", "a", "", 0, req);
+    var cb: u8[>..] = [];
+    let e1, h1 = http::client_read(cl, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", cb, cb);
+    let e2, h2 = http::client_read(cl, "", cb, cb);
+    check("client: closed after Connection: close", e1.kind == http::EV_RESPONSE && http::client_closed(cl) && e2.kind == http::EV_CLOSED);
 }
 
 fn bodies() {
@@ -136,7 +189,7 @@ fn errors() {
         check("error status", ev.kind == http::EV_ERROR && ev.status == want[i] && http::closing(c));
         check("error answer", starts_with(out, expect) && find(out, "Connection: close\r\n") > 0 && ends_with(out, "\r\n\r\n"));
         let e2, h2 = http::server_read(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n", body, trailer, out);
-        check("nothing read after an error", e2.kind == http::EV_ERROR);
+        check("nothing read after an error: closed", e2.kind == http::EV_CLOSED && e2.used == 0);
     }
     // A chunked body past max_body.
     var opt = http::server_options();
@@ -345,7 +398,7 @@ fn talk() {
                     http::server_end(sv, "X-Done: yes\r\n", to_client);
                     answered = true;
                 }
-                if ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR { break; }
+                if ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR || ev.kind == http::EV_CLOSED { break; }
             }
             if to_client.len > 0 { cbuf.push(to_client[0]); drop(to_client, 1); }
             loop {
@@ -363,6 +416,7 @@ fn talk() {
 
 fn main() {
     pipelining();
+    ends_and_close();
     bodies();
     errors();
     versions_and_kinds();

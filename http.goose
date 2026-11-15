@@ -10,6 +10,10 @@
 namespace http;
 
 import std;
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 
 // A part of the buffer a message was parsed from.
 struct Span { pos: i64, end: i64 }

@@ -16,7 +16,7 @@ import std;
 import base64;
 import http;
 import url;
-import bignum from "../bigmongoose.git";
+import bignum;
 import bignum.md5;
 import bignum.sha256;
 import bignum.sha512;

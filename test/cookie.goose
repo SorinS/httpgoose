@@ -6,6 +6,12 @@
 
 import std;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.url;
 import http.cookie;
 
@@ -405,6 +411,16 @@ fn files() {
     var text2: u8[>..] = [];
     http::jar_save_netscape(k, text2, T0 + 3600000, false);
     check_bool("sessions left out", find(text2, "\ts\t1") < 0, true);
+    // An expiry past i64's milliseconds is held at the end of time.
+    var big = http::new_jar();
+    let nb = http::jar_load_netscape(big, none, "www.example.com\tFALSE\t/\tFALSE\t9223372036854775807\tb\t1\n", T0);
+    var bl: u8[>..] = [];
+    http::jar_cookie_header(big, none, u, T0, bl);
+    check_bool("huge expiry loaded", nb == 1, true);
+    check("huge expiry cookie", bl, "b=1");
+    var bt: u8[>..] = [];
+    http::jar_save_netscape(big, bt, T0, false);
+    check_bool(str("huge expiry saved as the end of time: ", bt), find(bt, "\t253402300799\tb\t1") >= 0, true);
 }
 
 fn main() {

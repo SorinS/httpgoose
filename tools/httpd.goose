@@ -3,7 +3,7 @@
 //
 //   goose-httpd --root DIR [--listen 127.0.0.1] [--port 8080]
 //               [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]]
-//               [--http1.1] [--late-ticket]
+//               [--http1.1] [--late-ticket] [--max-conns 1024]
 //
 // HTTP/2 is offered by ALPN ("h2" before "http/1.1") over TLS, and taken
 // over TCP from a client that starts with its preface (prior knowledge,
@@ -13,7 +13,8 @@
 // /echo answers with the request's body; anything else is 405. Paths are
 // percent-decoded once, may not hold ".." segments or NUL, and must
 // resolve, symbolic links followed, to a file inside DIR. Each connection
-// is served by a process of its own; one line a request goes to stderr.
+// is served by a thread of its own, at most --max-conns at once (see
+// "Running connections"); one line a request goes to stderr.
 // It listens on 127.0.0.1 unless told otherwise. --late-ticket (for
 // tests) sends another TLS 1.3 session ticket a moment after each
 // response, when the connection is idle.
@@ -21,17 +22,21 @@
 import std;
 import os;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.conn1;
+import http.url;
 import http.hpack;
 import http.h2;
-import bignum from "../../bigmongoose.git";
-import asn1 from "../../asn1goose.git";
-import x509 from "../../x509goose.git";
-import tls from "../../tlsgoose.git";
 import tls.handshake;
 import sysnet;
 
 let IDLE_MS: i32 = 30000;
+let MAX_ROOT: i64 = 4096;
 let MAX_FILE: i64 = 1 << 28;
 var late_ticket = false;
 var http2 = true;
@@ -99,7 +104,7 @@ fn decoded_path(target: const u8[:]) -> u8[>..] {
     return out;
 }
 
-struct Answer { status: i64, ctype: u8[..64], extra: u8[..256] }
+struct Answer { status: i64, ctype: u8[..64], extra: u8[>..] }
 
 // The file a GET or HEAD names, into `body`: 200, or 404 or 403.
 fn file_answer(root: const u8[:], path: const u8[:], body: u8[>..]&) -> Answer {
@@ -110,8 +115,10 @@ fn file_answer(root: const u8[:], path: const u8[:], body: u8[>..]&) -> Answer {
     if is_dir(full) {
         if !ends_with(path, "/") {
             a.status = 301;
+            // The decoded path, escaped again: as long as the request's,
+            // and nothing in it ends the field.
             a.extra.append("Location: ");
-            a.extra.append(path);
+            http::escape_to(a.extra, path, http::ENC_PATH);
             a.extra.append("/\r\n");
             return a;
         }
@@ -232,7 +239,8 @@ fn serve(fd: i32, root: const u8[:], on_tls: bool, scfg: const tls::ServerConfig
                 answer(hc, root, method, target, body, plain);
                 if http::closing(hc) { stop = true; }
             }
-            if stop || ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR { break; }
+            if stop || ev.kind == http::EV_NEED_MORE || ev.kind == http::EV_WAIT || ev.kind == http::EV_ERROR ||
+               ev.kind == http::EV_CLOSED { break; }
         }
         if !flush(fd, on_tls, tc, plain, wire) { break; }
         if late_ticket && on_tls && !stop && !http::closing(hc) && tls::version(tc) == tls::VERSION_TLS13 {
@@ -461,6 +469,75 @@ fn make_answer(root: const u8[:], method: const u8[:], target: const u8[:], body
     return status;
 }
 
+// --- Running connections ----------------------------------------------------
+//
+// serve() handles one connection from accept to close, and blocks only in
+// sysnet (net_wait, net_read, net_write). What knows that connections run
+// at once is this section. Each runs on a Goose thread (spec §11.2), a
+// contained one, so an abort ends that connection only, as a process of
+// its own did. With coroutines, conn_worker becomes a coroutine's body,
+// run_conn starts one, the slots and the reaper become the scheduler's
+// count, and sysnet's waits yield instead of blocking: serve() and what it
+// calls stay as they are.
+//
+// A thread shares no memory: its arguments are copied in, and so is every
+// global it uses (late_ticket, http2), as they are when it starts. Every
+// connection gets the same TLS configuration, so its session ticket key,
+// and a ticket from one connection resumes on another.
+
+// What every connection is given beside its socket.
+struct Site { root: u8[..4096], on_tls: bool }
+
+// A free place for a connection: main takes one before it accepts, and a
+// connection gives it back when it ends (the reaper, when it aborted).
+struct Slot { free: bool }
+
+// A connection's thread, for the reaper.
+struct Running { id: i64, fd: i32 }
+
+thread_fn conn_worker(fd: i32, site: Site, scfg: tls::ServerConfig) {
+    serve(fd, site.root, site.on_tls, scfg);
+    qput(Slot { free: true });
+}
+
+// Waits for each connection's thread in turn. One that aborted left its
+// socket open and its slot taken: close it, give the slot back, and log
+// why. One that returned did both itself.
+thread_fn reaper() {
+    loop {
+        let r = qget<Running>();
+        var msg: u8[>..] = [];
+        if !thread_wait(r.id, msg) {
+            sysnet::net_close(r.fd);
+            qput(Slot { free: true });
+            var line: u8[>..] = [];
+            line.append("goose-httpd: a connection ended in an abort: ");
+            line.append(msg);
+            line.push('\n');
+            write_stderr(line);
+        }
+    }
+}
+
+// Serves fd on a thread of its own.
+fn run_conn(fd: i32, site: const Site&, scfg: const tls::ServerConfig&) {
+    let id = thread_spawn_contained(conn_worker, fd, site, copy(scfg));
+    qput(Running { id: id, fd: fd });
+}
+
+// Accepts connections on lfd and runs each, at most max_conns at once; a
+// connection past them waits in the listening socket's queue.
+fn accept_loop(lfd: i32, max_conns: i64, site: const Site&, scfg: const tls::ServerConfig&) {
+    for k in max_conns { qput(Slot { free: true }); }
+    thread_spawn(reaper);
+    loop {
+        let slot = qget<Slot>();
+        let fd = sysnet::net_accept(lfd);
+        if fd < 0 { qput(slot); continue; }
+        run_conn(fd, site, scfg);
+    }
+}
+
 fn main() {
     let a = args();
     var root: u8[>..] = [];
@@ -471,6 +548,7 @@ fn main() {
     var key: u8[>..] = [];
     var tls_max: u8[>..] = [];
     tls_max.append("1.3");
+    var max_conns: i64 = 1024;
     var i = 1;
     while i < a.len {
         if a[i] == "--late-ticket" { late_ticket = true; i++; continue; }
@@ -487,12 +565,18 @@ fn main() {
         else if a[i] == "--cert" { cert.append(v); }
         else if a[i] == "--key" { key.append(v); }
         else if a[i] == "--tls-max" { tls_max.clear(); tls_max.append(v); }
-        else { die("usage: goose-httpd --root DIR [--listen ADDR] [--port N] [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]] [--http1.1] [--late-ticket]"); }
+        else if a[i] == "--max-conns" {
+            let n, ok = parse_int(v);
+            if !ok || n < 1 || n > 100000 { die("bad --max-conns"); }
+            max_conns = n;
+        }
+        else { die("usage: goose-httpd --root DIR [--listen ADDR] [--port N] [--cert chain.pem --key key.pem [--tls-max 1.2|1.3]] [--http1.1] [--late-ticket] [--max-conns N]"); }
         i += 2;
     }
     if root.len == 0 { die("--root is required"); }
     let real_root = sysnet::realpath(root);
     if real_root.len == 0 || !is_dir(real_root) { die("--root is no directory"); }
+    if real_root.len > MAX_ROOT { die("--root's path is too long"); }
     let on_tls = cert.len > 0;
     var chain: u8[>..] = [];
     var key_der: u8[>..] = [];
@@ -517,16 +601,7 @@ fn main() {
     format(line, sysnet::net_local_port(lfd));
     line.append(if on_tls { " (TLS)\n" } else { "\n" });
     write_stderr(line);
-    loop {
-        let fd = sysnet::net_accept(lfd);
-        sysnet::proc_reap();
-        if fd < 0 { continue; }
-        let pid = sysnet::proc_fork();
-        if pid == 0 {
-            sysnet::net_close(lfd);
-            serve(fd, real_root, on_tls, scfg);
-            sysnet::proc_exit(0);
-        }
-        sysnet::net_close(fd);
-    }
+    var site = Site { root: [], on_tls: on_tls };
+    site.root.append(real_root);
+    accept_loop(lfd, max_conns, site, scfg);
 }

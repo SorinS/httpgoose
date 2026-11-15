@@ -5,16 +5,20 @@
 // eviction. scripts/interop.py runs the rest against real servers.
 
 import std;
-import bignum from "../../bigmongoose.git";
-import asn1 from "../../asn1goose.git";
-import x509 from "../../x509goose.git";
-import tls from "../../tlsgoose.git";
-import tls.session;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
+import tls.session;
 import http.url;
 import http.cookie;
 import http.client;
 import http.fetch;
+import ntlm.messages;
+import ntlm.http;
 
 var failures = 0;
 
@@ -175,7 +179,25 @@ fn session_cache() {
     check("no cache", cached(off, "a"), "-");
 }
 
+// Which 401s fetch answers with NTLM (AUTH_NTLM, and AUTH_ANY when no
+// Digest is offered), and the CHALLENGE it takes from the second one.
+fn ntlm_challenges() {
+    let s1, d1 = http::ntlm_offered("WWW-Authenticate: Negotiate\r\nWWW-Authenticate: NTLM\r\n");
+    check("NTLM over Negotiate", str(s1, d1), str(ntlm::SCHEME_NTLM, false));
+    let s2, d2 = http::ntlm_offered("WWW-Authenticate: Negotiate, Digest realm=\"x\", nonce=\"n\"\r\n");
+    check("Negotiate alone, Digest too", str(s2, d2), str(ntlm::SCHEME_NEGOTIATE, true));
+    let s3, d3 = http::ntlm_offered("WWW-Authenticate: Basic realm=\"x\"\r\n");
+    check("no NTLM", str(s3, d3), str(ntlm::SCHEME_NONE, false));
+    let c1, ok1 = http::ntlm_challenge("WWW-Authenticate: NTLM TlRMTVNTUAACAAAA\r\n", ntlm::SCHEME_NTLM);
+    check("CHALLENGE token", str(ok1, c1.len), str(true, 12));
+    let c2, ok2 = http::ntlm_challenge("WWW-Authenticate: Negotiate TlRMTVNTUAACAAAA\r\n", ntlm::SCHEME_NTLM);
+    check("CHALLENGE under the other scheme", str(ok2), str(false));
+    let c3, ok3 = http::ntlm_challenge("WWW-Authenticate: NTLM YWJjZGVmZ2hpamts\r\n", ntlm::SCHEME_NTLM);
+    check("not NTLMSSP", str(ok3), str(false));
+}
+
 fn main() {
+    ntlm_challenges();
     session_cache();
     proxy_vectors();
     explicit_proxy();

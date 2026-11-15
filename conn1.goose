@@ -4,20 +4,30 @@
 //
 //   var c = http::server_conn(http::server_options());
 //   loop {
-//       let ev, h = http::server_read(c, buf, body, trailer);
+//       let ev, h = http::server_read(c, buf, body, trailer, out);
 //       // EV_REQUEST: h is the head, its spans into buf (read them now)
-//       // EV_BODY: data appended to body; EV_END: the request is complete
-//       // EV_NEED_MORE: read more into buf; EV_ERROR: send out, then close
+//       // EV_BODY: data appended to body
+//       // EV_END: the request is complete (one without a body too):
+//       //     server_respond, server_body, server_end into out
+//       // EV_NEED_MORE: read more into buf; EV_WAIT: send out first
+//       // EV_CLOSED: send out, then close; EV_ERROR: the same, out
+//       //     holding the error's answer
 //       buf = buf[ev.used..]        // the caller drops what was used
 //   }
-//   http::server_respond(c, 200, fields, 5, out);    // or -1: chunked
-//   http::server_body(c, "hello", out);
-//   http::server_end(c, "", out);                   // then: closing(c)?
+//
+// Every request a server reads is REQUEST, BODY..., END: one without a
+// body is REQUEST then END (used 0). A caller may answer at REQUEST
+// already, request_complete(c) telling it the request has no body to
+// read; that request's END is then not reported. A client's response
+// without a body (HEAD's, 204, 304) is complete at RESPONSE: the
+// connection is then client_idle or client_closed, with no END.
 //
 // The connection answers requests in order: the next request is not read
 // until the response to this one has ended. A response that ends before
 // its request's body was all read closes the connection, as do HTTP/1.0
-// without keep-alive, Connection: close either way, and every error.
+// without keep-alive, Connection: close either way, and every error. Read
+// after that, a connection says CLOSED, not ERROR: the error, if there was
+// one, was the event before.
 
 namespace http;
 
@@ -32,11 +42,12 @@ let EV_BODY: u8 = 3;           // body data appended
 let EV_END: u8 = 4;            // the body (or a message without one) is complete
 let EV_ERROR: u8 = 5;          // the connection failed; for a server, out holds the answer
 let EV_WAIT: u8 = 6;           // a server's: a request is being answered, nothing more is read
+let EV_CLOSED: u8 = 7;         // the connection is done (it closed, or failed before): nothing more is read
 
 struct Event {
     kind: u8,
     used: i64,                  // bytes of the buffer this event took
-    status: i64,                // EV_ERROR: the status (a server's answer), or 0
+    status: i64,                // EV_ERROR: a server's answer (a client's: 0)
     continue_expected: bool,    // EV_REQUEST: Expect: 100-continue
 }
 
@@ -64,6 +75,7 @@ struct ServerConn {
     remaining: i64,             // BODY_LENGTH: bytes left
     body_read: i64,
     request_done: bool,         // its body all read
+    end_owed: bool,             // a request without a body: its END is the next event
     keep: bool,                 // the request allows the connection to stay
     head: bool,                 // the request was HEAD
     continue_expected: bool, continue_sent: bool,
@@ -80,7 +92,7 @@ struct ServerConn {
 fn server_conn(opt: ServerOptions) -> ServerConn {
     ServerConn {
         opt: opt, state: SV_HEAD, fr: Framing { kind: BODY_NONE, length: 0 }, ck: chunked_decoder(),
-        remaining: 0, body_read: 0, request_done: false, keep: true, head: false,
+        remaining: 0, body_read: 0, request_done: false, end_owed: false, keep: true, head: false,
         continue_expected: false, continue_sent: false,
         responding: false, resp_chunked: false, resp_close_delimited: false, resp_remaining: -1, resp_body: true,
         minor: 1, requests: 0,
@@ -89,8 +101,8 @@ fn server_conn(opt: ServerOptions) -> ServerConn {
 
 fn closing(c: const ServerConn&) -> bool { c.state == SV_CLOSING }
 
-// Whether the request being answered has been read whole: after a
-// REQUEST event without a body, or after END.
+// Whether the request being answered has been read whole: after END, or
+// already at the REQUEST event of one without a body.
 fn request_complete(c: const ServerConn&) -> bool { c.request_done && c.state != SV_HEAD }
 
 // An error answer, then no more requests.
@@ -100,6 +112,7 @@ fn server_fail(c: ServerConn&, status: i64, out: u8[>..]&) -> Event {
     f.append("Connection: close\r\n");
     if !c.responding { write_response_head(out, status, f); }
     c.state = SV_CLOSING;
+    c.end_owed = false;
     var ev = event(EV_ERROR, 0);
     ev.status = status;
     return ev;
@@ -111,7 +124,8 @@ fn server_fail(c: ServerConn&, status: i64, out: u8[>..]&) -> Event {
 // if the request could not be read, is in `out`.
 fn server_read(c: ServerConn&, m: const u8[:], body: u8[>..]&, trailer: u8[>..]&, out: u8[>..]&) -> Event, Head {
     var h = new_head(KIND_REQUEST);
-    if c.state == SV_CLOSING { return event(EV_ERROR, 0), h; }
+    if c.end_owed { c.end_owed = false; return event(EV_END, 0), h; }
+    if c.state == SV_CLOSING { return event(EV_CLOSED, 0), h; }
     if c.state == SV_ANSWER { return event(EV_WAIT, 0), h; }
     if c.state == SV_HEAD {
         let hh, n = parse_request(m, c.opt.lim);
@@ -135,6 +149,7 @@ fn server_read(c: ServerConn&, m: const u8[:], body: u8[>..]&, trailer: u8[>..]&
         c.resp_remaining = -1;
         c.requests++;
         c.request_done = fr.kind == BODY_NONE;
+        c.end_owed = c.request_done;
         c.state = if c.request_done { SV_ANSWER } else { SV_BODY };
         var ev = event(EV_REQUEST, n);
         ev.continue_expected = c.continue_expected;
@@ -233,6 +248,7 @@ fn server_end(c: ServerConn&, trailer: const u8[:], out: u8[>..]&) -> bool {
     if c.resp_chunked { write_last_chunk(out, trailer); }
     if c.resp_remaining > 0 { ok = false; }
     c.responding = false;
+    c.end_owed = false;
     if !ok || !c.keep || !c.request_done || c.resp_close_delimited { c.state = SV_CLOSING; }
     else { c.state = SV_HEAD; }
     return ok;
@@ -308,11 +324,12 @@ fn has_close(fields: const u8[:]) -> bool {
 fn trim_cr(s: const u8[:]) -> const u8[:] { if s.len > 0 && s[s.len - 1] == '\r' { s[..s.len - 1] } else { s } }
 
 // What the buffer holds next: RESPONSE (a 1xx one is followed by another
-// RESPONSE), BODY, END, NEED_MORE, or ERROR. After END the connection is
-// idle for the next request, or closed.
+// RESPONSE), BODY, END, NEED_MORE, ERROR, or CLOSED once the connection
+// is. After END the connection is idle for the next request, or closed; so
+// it is already after the RESPONSE of one without a body, with no END.
 fn client_read(c: ClientConn&, m: const u8[:], body: u8[>..]&, trailer: u8[>..]&) -> Event, Head {
     var h = new_head(KIND_RESPONSE);
-    if c.state == CL_CLOSED { return event(EV_ERROR, 0), h; }
+    if c.state == CL_CLOSED { return event(EV_CLOSED, 0), h; }
     if c.state == CL_IDLE {
         // Bytes no request asked for.
         if m.len > 0 { c.state = CL_CLOSED; return event(EV_ERROR, 0), h; }

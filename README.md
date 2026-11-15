@@ -1,7 +1,7 @@
 # httpgoose
 
 HTTP for Goose: HTTP/1.1 and HTTP/2, with HTTPS through
-[tlsgoose](../tlsgoose.git). The protocol code does no I/O: it parses and
+[tlsgoose](https://github.com/SorinS/tlsgoose). The protocol code does no I/O: it parses and
 writes byte strings, and the caller owns the sockets.
 
 | Module | What |
@@ -9,17 +9,23 @@ writes byte strings, and the caller owns the sockets.
 | `http` | RFC 9110's syntax: tokens, field names and values, fields of a parsed message, status codes, building field sections |
 | `http.h1` | RFC 9112: request and response heads, body framing (§6.3), the chunked coding (§7.1), writing messages |
 | `http.url` | RFC 3986 URLs as Go's net/url reads them: parsing, resolving references (§5.2), percent-encoding, queries and forms, IP addresses, Punycode host names |
-| `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt |
+| `http.cookie` | RFC 6265 cookies: Set-Cookie as a user agent parses it, a jar that behaves as Go's net/http/cookiejar, publicsuffix.org's list (built in on request), curl's cookies.txt (an expiry past 9999-12-31 held there) |
 | `http.auth` | RFC 9110 §11 challenges; Basic (RFC 7617), Bearer (RFC 6750), Digest (RFC 7616: MD5, SHA-256, SHA-512-256, -sess, auth and auth-int, userhash) |
-| `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes |
-| `http.client` | The I/O: HTTP/2 by ALPN over TLS (Go's DefaultTransport offers it; `opt.http2`), or over TCP with prior knowledge (`opt.h2c`), its connections shared by the requests to one origin, another opened past the server's limit of streams (Go's way), streams refused or past a GOAWAY sent again on a new connection whatever the method (as Go); HTTP/1.1 otherwise; a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, several responses open at once and read in any order (each with its connection's input and its own gzip decoder and deadline), bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets in `src/httpnet.c`, compiled only into programs that use this module |
-| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch`, and `fetch_stream` for a body read as it is sent (started again for a hop that sends it again if it can be, as Go's GetBody; else that hop's response is handed back, as Go does) |
+| `http.flate` | gzip (RFC 1952, several members), zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, fed as the body comes, with a limit on what it decodes (`inflate_feed`'s `limit`): the client's `read_body` decodes no more than `opt.max_body` into its output, failing with `ERR_TOO_LARGE` past it, so a small read cannot inflate a thousandfold first |
+| `http.client` | The I/O: HTTP/2 by ALPN over TLS (Go's DefaultTransport offers it; `opt.http2`), or over TCP with prior knowledge (`opt.h2c`), its connections shared by the requests to one origin, another opened past the server's limit of streams (Go's way), streams refused or past a GOAWAY sent again on a new connection whatever the method (as Go); HTTP/1.1 otherwise; a pool of connections per origin (Go's idle limits), TLS through tlsgoose with a cache of sessions to resume (Go's LRU ClientSessionCache, 64 server names; on unless `opt.tls_sessions` is 0, as in curl, where Go's Transport resumes only when given a cache), timeouts, retrying a replayable request on a connection the server had closed, several responses open at once and read in any order (each with its connection's input and its own gzip decoder and deadline), bodies read whole or as a stream, and sent as they come (`begin_request`, `write_body`, `end_request`: Content-Length or chunks, Expect: 100-continue with Go's ExpectContinueTimeout, a final response before the body's end stopping the sending); HTTP proxies (absolute-form, CONNECT, an https proxy with TLS inside TLS) and SOCKS5 (RFC 1928/1929). Sockets from gslib's `net` module (`net.goose`, C in `net/src/net.c`), compiled only into programs that use it |
+| `http.fetch` | The policy of Go's http.Client: redirects by Go's rules, the cookie jar, credentials (Basic at once or in answer to a 401; Digest, its challenge then answered again for the protection space with the next nc, RFC 7616 §3.4, where curl answers a new 401 each time; NTLMv2 with `AUTH_NTLM`, or after Digest with `AUTH_ANY` (gslib's ntlm: `NTLM` or `Negotiate` with raw NTLMSSP, over HTTP/1.1, tls-server-end-point bindings); Bearer; a proxy's 407), HTTP_PROXY/HTTPS_PROXY/NO_PROXY by Go's rules, gzip decoded as it is read; `get`, `head`, `post`, `post_form`, `request`, `fetch`, and `fetch_stream` for a body read as it is sent (started again for a hop that sends it again if it can be, as Go's GetBody; else that hop's response is handed back, as Go does) |
 | `http.hpack` | RFC 7541's header compression: a dynamic table of fixed size (4096 bytes), Huffman coding, a decoder of header blocks that refuses what the RFC has it refuse, and an encoder in Go's way |
 | `http.h2` | RFC 9113 connections, server and client, without I/O: frames, settings, stream states, flow control (windows given back as the application uses the data), header blocks with CONTINUATION taken whole, and §8's rules for messages (pseudo-header fields, connection-specific fields, content-length against the DATA, Host and :authority); a server answers 431 past its header list limit and refuses streams past its limit. Of fixed size (some 27 KB a connection, 256 streams at once). Go's defaults: 250 streams, 1 MiB windows for a server |
 | `http.conn1` | HTTP/1.1 connections, server and client: events for heads, body data and ends; requests answered in order; keep-alive and close; HEAD, 1xx, 204, 304; 100-continue; body limits (413) |
 
 ```goose
-import http from "../httpgoose.git";
+import http from "SorinS/httpgoose@v0.7.0";
+import net from "SorinS/netgoose@v0.7.0";   // http needs it; the root declares it
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.h1;
 
 let lim = http::default_limits();
@@ -41,18 +47,28 @@ import http.conn1;
 var c = http::server_conn(http::server_options());
 let ev, h = http::server_read(c, buf, body, trailer, out);
 // EV_REQUEST (h's spans point into buf), EV_BODY, EV_END, EV_NEED_MORE,
-// EV_WAIT (answer this request first), EV_ERROR (out holds the answer)
-// then drop ev.used bytes from buf
+// EV_WAIT (answer this request first), EV_ERROR (out holds the answer),
+// EV_CLOSED (nothing more is read: send out, then close)
+// then drop ev.used bytes from buf; at EV_END:
 http::server_respond(c, 200, fields, length, out);   // length -1: chunked
 http::server_body(c, data, out);
 http::server_end(c, trailer_fields, out);           // then http::closing(c)?
 ```
 
+Every request is `EV_REQUEST`, `EV_BODY`..., `EV_END`; one without a body
+is `EV_REQUEST` then `EV_END`, so a server answers at `EV_END`. (It may
+answer at `EV_REQUEST` already when `http::request_complete(c)` says
+there is no body; that request's `EV_END` is then not reported.) A
+client's response without a body (to HEAD, 204, 304) is complete at
+`EV_RESPONSE`, the connection then `client_idle` or `client_closed`.
+
 A connection reads the next request only after the response to the one
 before has ended, so pipelined requests are answered in order. It closes
 after a response that ended before its request's body was read (so no
 unread body is taken for a request), after HTTP/1.0 without keep-alive,
-Connection: close from either side, and every error.
+Connection: close from either side, and every error. Read after that, a
+connection reports `EV_CLOSED`, not an error: an error is reported once,
+as the event that closed it.
 
 ## Strictness
 
@@ -96,7 +112,8 @@ of trailer.
 
 `http.client` and `http.fetch` keep a client's parts (its pool, buffers,
 TLS settings, cookie jar) in a `root struct`, which needs a compiler from
-goose.git 704214cc on (v2026.3-252 is what the tests ran with). The
+goose.git's master from 683ebc94 (v2026.3-154) on (v2026.3-252 is what
+the tests ran with). The
 parsers and the other modules need none of it, and no C.
 
 ## Tools
@@ -105,7 +122,9 @@ parsers and the other modules need none of it, and no C.
 HTTP/2, plain or HTTPS through tlsgoose (TLS 1.3 unless `--tls-max 1.2`
 holds it to TLS 1.2; HTTP/2 by ALPN, or on TCP to a client that starts
 with HTTP/2's preface; `--http1.1` for HTTP/1.1 alone), on
-127.0.0.1 unless told otherwise, one process a connection; GET and HEAD,
+127.0.0.1 unless told otherwise, one Goose thread a connection (at most
+`--max-conns` at once, 1024 unless told otherwise; the rest wait in the
+listening socket's queue); GET and HEAD,
 and POST /echo. Paths are percent-decoded once, refuse `..` segments and
 NUL, and must resolve, symbolic links followed, inside the root.
 `tools/http.goose` (goose-http) is a client on `http.fetch` with curl's
@@ -120,6 +139,15 @@ upload a file or stdin as it is read (chunks for stdin; Expect:
 connection for URLs of one origin, and TLS sessions to resume new ones.
 `goose-httpd --late-ticket` sends a TLS 1.3 session ticket after each
 response, when the connection is idle, for testing clients.
+
+A connection's thread has the system's default native stack, 512 KB on
+macOS and 1 MB on Windows (Linux's is 8 MB), and Goose gives no way to
+ask for more. A TLS connection takes about 180 KB of it, most of that its
+copy of the server's configuration (measured with clang's
+`-fstack-usage`): certificate pools grow on Goose's data stacks, and
+`tls::server_feed` builds no client configuration. Every connection gets a
+copy of the same TLS configuration, so of its session ticket key, and a
+ticket from one connection resumes on another.
 
 ```bash
 goose build tools/httpd.goose && tools/goose-httpd --root site --port 8080 [--cert c.pem --key k.pem --tls-max 1.2]
@@ -139,6 +167,22 @@ goose build tools/http.goose && tools/goose-http [-L] [-X M] [-d DATA] [-H 'N: v
 - `Client` is a `root struct`, so it can't be returned from a function or
   kept inside another struct.
 
+## Examples
+
+In `examples/`, run from the repository's top as `goose examples/<name>.goose`
+(or from that folder); each checks its own results.
+
+- `urls.goose`: URLs: parsing, resolving links, query strings, escaping, request targets.
+- `cookies.goose`: Set-Cookie, a cookie jar with the public suffix list, and curl's cookies.txt.
+- `auth.goose`: WWW-Authenticate challenges, Digest answers, Basic and Bearer credentials.
+- `hpack.goose`: HTTP/2 header compression: an encoder and decoder over three requests, and Huffman coding.
+- `h1_messages.goose`: HTTP/1.1 messages as bytes: framing, chunked bodies with trailers, and smuggling refused.
+- `h1_conn.goose`: an HTTP/1.1 client and server in memory over one keep-alive connection.
+- `h2_conn.goose`: an HTTP/2 client and server in memory: two streams through a flow-control window, a trailer.
+- `content_coding.goose`: gzip and deflate response bodies decoded as they arrive.
+- `client.goose`: the everyday client calls: GET, HEAD, POST of JSON and a form, cookies, redirects: `URL`. Needs a live server; `run_tests.py` only type-checks it.
+- `client_streams.goose`: a streamed upload, a download read in pieces, three requests at once: `URL [UPLOAD_URL]`. Needs a live server; `run_tests.py` only type-checks it.
+
 ## Tests
 
 ```bash
@@ -146,7 +190,7 @@ python3 scripts/run_tests.py [--native]        # test/*.goose at -O0, -O2, --deb
 python3 scripts/h1_differential.py [--seed N] [--random N] [-v]
 python3 scripts/url_differential.py [--seed N] [--random N] [-v]
 python3 scripts/flate_differential.py [--seed N] [--count N] [-v]
-python3 scripts/httpnet_check.py [--cc CC | --msvc]   # src/httpnet.c alone, also on Windows
+python3 ../scripts/net_check.py [--cc CC | --msvc]   # net's C (net/src/net.c) alone, also on Windows
 python3 scripts/upfile_check.py [--cc CC | --msvc]    # tools/upfile.c (goose-http -T) alone, also on Windows
 python3 scripts/gen_cookie_vectors.py      # Go's cookiejar tables -> test/vectors/cookiejar*.txt
 python3 scripts/gen_proxy_vectors.py       # x/net's httpproxy tables -> test/vectors/proxy.txt

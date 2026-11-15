@@ -16,8 +16,8 @@
 //   }
 //
 // Several responses may be open at once, each on its connection, and read
-// in any order. The sockets are in src/httpnet.c, built with programs
-// that use this module.
+// in any order. The sockets are net's (net.goose, net::dial and the
+// rest).
 
 namespace http;
 
@@ -31,21 +31,10 @@ import h2;
 import url;
 import cookie;
 import flate;
-import tls from "../tlsgoose.git";
+import tls;
 import tls.handshake;
 import tls.session;
-
-extern fn httpnet_connect(host: const u8[:], port: i32, timeout_ms: i32) -> i64;
-extern fn httpnet_read(fd: i64, buf: u8[:], timeout_ms: i32) -> i64;
-extern fn httpnet_write(fd: i64, data: const u8[:], timeout_ms: i32) -> i64;
-extern fn httpnet_readable(fd: i64) -> i32;
-extern fn httpnet_close(fd: i64);
-
-let NET_EARG: i64 = -1;
-let NET_ERESOLVE: i64 = -2;
-let NET_ECONNECT: i64 = -3;
-let NET_ETIMEOUT: i64 = -4;
-let NET_EIO: i64 = -5;
+import net;
 
 // A Response's errors.
 let ERR_NONE: i64 = 0;
@@ -104,10 +93,13 @@ struct ClientOptions {
 
 // How a client's credentials (set_credentials) go to servers: Basic before
 // any challenge (as Go sends a URL's userinfo), or only in answer to a 401
-// with the scheme it asks for (Digest, or Basic), or Digest only.
+// with the scheme it asks for (Digest, then NTLM, then Basic, as curl's
+// --anyauth ranks them), or Digest only, or NTLM only (gslib's ntlm,
+// NTLMv2: "NTLM", or "Negotiate" carrying NTLMSSP; over HTTP/1.1).
 let AUTH_BASIC: u8 = 1;
 let AUTH_ANY: u8 = 2;
 let AUTH_DIGEST: u8 = 3;
+let AUTH_NTLM: u8 = 4;
 
 fn client_options() -> ClientOptions {
     var o = ClientOptions {
@@ -321,10 +313,10 @@ fn wait_ms(c: const Client&, per_op: i64) -> i64 {
 }
 
 fn net_error(n: i64) -> i64 {
-    if n == NET_ERESOLVE { return ERR_RESOLVE; }
-    if n == NET_ECONNECT { return ERR_CONNECT; }
-    if n == NET_ETIMEOUT { return ERR_TIMEOUT; }
-    if n == NET_EARG { return ERR_URL; }
+    if n == net::ERR_RESOLVE { return ERR_RESOLVE; }
+    if n == net::ERR_CONNECT { return ERR_CONNECT; }
+    if n == net::ERR_TIMEOUT { return ERR_TIMEOUT; }
+    if n == net::ERR_ARG { return ERR_URL; }
     return ERR_IO;
 }
 
@@ -456,13 +448,13 @@ fn conn_close(c: Client&, i: i64) {
         if tls::connected(o.tc) {
             c.wire2.clear();
             tls::close(o.tc, c.wire2);
-            httpnet_write(pc.fd, c.wire2, 1000);
+            net::write(pc.fd, c.wire2, 1000);
             c.wire2.clear();
         }
         o.used = false;
         pc.outer = -1;
     }
-    httpnet_close(pc.fd);
+    net::close(pc.fd);
     pc.used = false;
     pc.idle = false;
     pc.fd = -1;
@@ -503,7 +495,7 @@ fn take_idle(c: Client&, key: const u8[:]) -> i64 {
         // asked for, and then it cannot carry a request; or, on TLS, only
         // handshake messages (a late NewSessionTicket, a KeyUpdate), read
         // here.
-        if httpnet_readable(pc.fd) != 0 && !idle_drain(c, i) { conn_close(c, i); continue; }
+        if net::readable(pc.fd) && !idle_drain(c, i) { conn_close(c, i); continue; }
         if best < 0 || pc.last_used > c.conns[best].last_used { best = i; }
     }
     if best >= 0 {
@@ -519,7 +511,7 @@ fn idle_drain(c: Client&, i: i64) -> bool {
     if !c.conns[i].is_tls { return false; }
     var app: u8[>..] = [];
     var rounds = 0;
-    while httpnet_readable(c.conns[i].fd) != 0 {
+    while net::readable(c.conns[i].fd) {
         rounds++;
         if rounds > 16 { return false; }
         c.mid.clear();
@@ -716,10 +708,10 @@ fn link_write_wire(c: Client&, i: i64, timeout: i64) -> i64 {
     if pc.outer >= 0 {
         c.wire2.clear();
         if !tls::send(c.outer[pc.outer].tc, c.wire, c.wire2) { c.wire.clear(); return ERR_TLS; }
-        n = httpnet_write(pc.fd, c.wire2, timeout as! i32);
+        n = net::write(pc.fd, c.wire2, timeout as! i32);
         c.wire2.clear();
     } else {
-        n = httpnet_write(pc.fd, c.wire, timeout as! i32);
+        n = net::write(pc.fd, c.wire, timeout as! i32);
     }
     c.wire.clear();
     return if n < 0 { net_error(n) } else { ERR_NONE };
@@ -733,7 +725,7 @@ fn link_read(c: Client&, i: i64, out: u8[>..]&, timeout_op: i64) -> i64 {
         let t = wait_ms(c, timeout_op);
         if t < 0 { return -ERR_TIMEOUT; }
         c.raw.resize(65536, 0);
-        let n = httpnet_read(pc.fd, c.raw, t as! i32);
+        let n = net::read(pc.fd, c.raw, t as! i32);
         if n < 0 { c.raw.clear(); return -net_error(n); }
         c.raw.resize(n);
         if n == 0 { return 0; }
@@ -749,7 +741,7 @@ fn link_read(c: Client&, i: i64, out: u8[>..]&, timeout_op: i64) -> i64 {
         c.tlscfg.server_name.append(o.server_name[..]);
         let e = tls::client_feed(o.tc, c.tlscfg, c.raw, c.wire2, out);
         c.raw.clear();
-        if c.wire2.len > 0 { httpnet_write(pc.fd, c.wire2, 5000); c.wire2.clear(); }
+        if c.wire2.len > 0 { net::write(pc.fd, c.wire2, 5000); c.wire2.clear(); }
         if e != 0 { return -ERR_TLS; }
         keep_session(c, i, true);
         if out.len > before { return 1; }
@@ -819,7 +811,9 @@ fn conn_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     pc.tc = tls::client(c.tlscfg);
     c.wire.clear();
     tls::client_start(pc.tc, c.tlscfg, c.wire);
-    let e = conn_handshake_run(c, i, name);
+    // A config TLS will not start with (verify on but no name, no
+    // version to offer) fails here, before anything is sent.
+    let e = if tls::failed(pc.tc) { ERR_TLS } else { conn_handshake_run(c, i, name) };
     c.tlscfg.session = tls::no_session();
     // A handshake that failed with a session offered drops it (as Go).
     if e != ERR_NONE && offered { session_drop(c, name); }
@@ -868,7 +862,7 @@ fn outer_handshake(c: Client&, i: i64, name: const u8[:]) -> i64 {
     o.tc = tls::client(c.tlscfg);
     c.wire2.clear();
     tls::client_start(o.tc, c.tlscfg, c.wire2);
-    let e = outer_handshake_run(c, i, k, name);
+    let e = if tls::failed(o.tc) { ERR_TLS } else { outer_handshake_run(c, i, k, name) };
     c.tlscfg.session = tls::no_session();
     if e != ERR_NONE && offered { session_drop(c, name); }
     if e == ERR_NONE { keep_session(c, i, true); }
@@ -882,26 +876,26 @@ fn outer_handshake_run(c: Client&, i: i64, k: i64, name: const u8[:]) -> i64 {
         let t = wait_ms(c, c.opt.connect_timeout_ms);
         if t < 0 { return ERR_TIMEOUT; }
         if c.wire2.len > 0 {
-            if httpnet_write(fd, c.wire2, t as! i32) < 0 { c.wire2.clear(); return ERR_IO; }
+            if net::write(fd, c.wire2, t as! i32) < 0 { c.wire2.clear(); return ERR_IO; }
             c.wire2.clear();
         }
         c.raw.resize(65536, 0);
-        let n = httpnet_read(fd, c.raw, t as! i32);
-        if n <= 0 { c.raw.clear(); return if n == NET_ETIMEOUT { ERR_TIMEOUT } else if n == 0 { ERR_TLS } else { ERR_IO }; }
+        let n = net::read(fd, c.raw, t as! i32);
+        if n <= 0 { c.raw.clear(); return if n == net::ERR_TIMEOUT { ERR_TIMEOUT } else if n == 0 { ERR_TLS } else { ERR_IO }; }
         c.raw.resize(n);
         c.tlscfg.server_name.clear();
         c.tlscfg.server_name.append(name);
         let e = tls::client_feed(o.tc, c.tlscfg, c.raw, c.wire2, c.mid);
         c.raw.clear();
         if e != 0 {
-            if c.wire2.len > 0 { httpnet_write(fd, c.wire2, 1000); }
+            if c.wire2.len > 0 { net::write(fd, c.wire2, 1000); }
             c.wire2.clear();
             return ERR_TLS;
         }
     }
     if c.wire2.len > 0 {
         let t = wait_ms(c, c.opt.connect_timeout_ms);
-        if httpnet_write(fd, c.wire2, if t < 0 { 1 } else { t as! i32 }) < 0 { c.wire2.clear(); return ERR_IO; }
+        if net::write(fd, c.wire2, if t < 0 { 1 } else { t as! i32 }) < 0 { c.wire2.clear(); return ERR_IO; }
         c.wire2.clear();
     }
     return ERR_NONE;
@@ -911,7 +905,7 @@ fn outer_handshake_run(c: Client&, i: i64, k: i64, name: const u8[:]) -> i64 {
 fn conn_dial(c: Client&, i: i64, host: const u8[:], port: i64) -> i64 {
     var t = wait_ms(c, c.opt.connect_timeout_ms);
     if t < 0 { return ERR_TIMEOUT; }
-    let fd = httpnet_connect(host, port as! i32, t as! i32);
+    let fd = net::dial(host, port as! i32, t as! i32);
     if fd < 0 { return net_error(fd); }
     let pc: PoolConn& = c.conns[i];
     pc.used = true;
@@ -1893,7 +1887,7 @@ fn wait_continue(c: Client&, r: Response&) {
 // the connection ended, or -ERR_*.
 fn conn_poll(c: Client&, i: i64) -> i64 {
     use_buf(c, i);
-    while httpnet_readable(c.conns[i].fd) != 0 {
+    while net::readable(c.conns[i].fd) {
         if !c.conns[i].is_tls {
             let n = link_read(c, i, c.buf, 1000);
             if n <= 0 { return n; }
@@ -2094,11 +2088,15 @@ fn read_body(c: Client&, r: Response&, out: u8[>..]&) -> i64 {
         let n = read_wire_body(c, r, wire);
         if n < 0 { inflate_free(c, r); return n; }
         let before = out.len;
-        if inflate_feed(c.inflates[k], wire, out) != 0 {
+        // No more decoded than max_body still allows (read_all's body
+        // grows in out): a small read must not inflate a thousandfold
+        // before the size is checked.
+        let fe = inflate_feed(c.inflates[k], wire, out, c.opt.max_body);
+        if fe != 0 {
             if r.conn >= 0 { conn_close(c, r.conn); r.conn = -1; }
             r.body_done = true;
             inflate_free(c, r);
-            return -ERR_DECODE;
+            return if fe == FLATE_ERR_LIMIT { -ERR_TOO_LARGE } else { -ERR_DECODE };
         }
         // The body ended: the gzip stream must have ended whole with it.
         if r.body_done {

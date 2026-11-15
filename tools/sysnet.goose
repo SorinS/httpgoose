@@ -17,9 +17,6 @@ extern fn net_close(fd: i32);
 extern fn net_shutdown_write(fd: i32);
 // 1 if fd is readable or closed, 0 on timeout, -1 on error.
 extern fn net_wait(fd: i32, timeout_ms: i32) -> i32;
-extern fn proc_fork() -> i32;
-extern fn proc_exit(code: i32);
-extern fn proc_reap();
 extern fn fs_realpath(path: const u8[:], out: u8[:]) -> i64;
 
 // Reads what is there (up to 64 KB) into a builder: how many bytes, 0 at

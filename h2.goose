@@ -216,7 +216,7 @@ fn put_u32(out: u8[>..]&, v: i64) {
 }
 
 fn get_u32(b: const u8[:], at: i64) -> i64 {
-    return ((b[at] as i64) << 24) | ((b[at + 1] as i64) << 16) | ((b[at + 2] as i64) << 8) | (b[at + 3] as i64);
+    return ((b[at] as i64) << 24) | ((b[at + 1] as i64) << 16) | ((b[at + 2] as i64) << 8) | b[at + 3];
 }
 
 fn frame_head(out: u8[>..]&, len: i64, ty: u8, flags: u8, stream: i64) {
@@ -433,9 +433,10 @@ fn h2_section(recs: const u8[:], kind: i64, lines: u8[>..]&, clen: i64&) -> i64 
             } else if kind == 1 {
                 if n == ":status" {
                     n_status++;
-                    if v.len != 3 { bad = true; }
+                    // Three digits, the length checked first: a long run must not overflow st.
                     var st: i64 = 0;
-                    for ch in v { if ch < '0' || ch > '9' { bad = true; } else { st = st * 10 + (ch - '0') as i64; } }
+                    if v.len != 3 { bad = true; }
+                    else { for ch in v { if ch < '0' || ch > '9' { bad = true; } else { st = st * 10 + (ch - '0') as i64; } } }
                     status = st;
                 } else { bad = true; }
             }
@@ -499,7 +500,7 @@ fn h2_read(c: H2Conn&, m: const u8[:], fields: u8[>..]&, body: u8[>..]&, out: u8
         return h2_event(EV2_NONE, H2_PREFACE.len);
     }
     if m.len < 9 { return h2_event(EV2_NEED_MORE, 0); }
-    let len = ((m[0] as i64) << 16) | ((m[1] as i64) << 8) | (m[2] as i64);
+    let len = ((m[0] as i64) << 16) | ((m[1] as i64) << 8) | m[2];
     let ty = m[3];
     let flags = m[4];
     let sid = get_u32(m, 5) & 0x7fffffff;
@@ -582,7 +583,7 @@ fn h2_read_settings(c: H2Conn&, sid: i64, flags: u8, p: const u8[:], used: i64, 
     var window_changed = false;
     var i = 0;
     while i < p.len {
-        let id = ((p[i] as i64) << 8) | (p[i + 1] as i64);
+        let id = ((p[i] as i64) << 8) | p[i + 1];
         let v = get_u32(p, i + 2);
         i += 6;
         if id == S2_HEADER_TABLE_SIZE {
@@ -753,7 +754,7 @@ fn h2_read_headers(c: H2Conn&, m: const u8[:], sid: i64, flags: u8, len: i64, fi
             if at - 9 - len > block_limit { return h2_fail(c, E2_ENHANCE_YOUR_CALM, out); }
             return h2_event(EV2_NEED_MORE, 0);
         }
-        let clen = ((m[at] as i64) << 16) | ((m[at + 1] as i64) << 8) | (m[at + 2] as i64);
+        let clen = ((m[at] as i64) << 16) | ((m[at + 1] as i64) << 8) | m[at + 2];
         let cty = m[at + 3];
         let cflags = m[at + 4];
         let csid = get_u32(m, at + 5) & 0x7fffffff;

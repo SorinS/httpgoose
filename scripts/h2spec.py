@@ -87,7 +87,7 @@ def main():
         with open(os.path.join(www, "big.bin"), "wb") as f:
             f.write(bytes((i * 7) % 251 for i in range(100000)))
         cert, key = os.path.join(tmp, "cert.pem"), os.path.join(tmp, "key.pem")
-        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-pkeyopt", "ec_param_enc:named_curve", "-nodes",
                         "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=localhost"], check=True, capture_output=True)
         version = subprocess.run([args.h2spec, "--version"], capture_output=True, text=True).stdout.strip()
         print(f"h2spec {version}")

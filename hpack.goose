@@ -52,7 +52,7 @@ fn hpack_table(limit: i64) -> HpackTable {
 // Where entry k (0: the oldest) starts in data.
 fn hpack_offset(t: const HpackTable&, k: i64) -> i64 {
     var at = 0;
-    for j in k { at += (t.nlen[j] as i64) + (t.vlen[j] as i64); }
+    for j in k { at += (t.nlen[j] as i64) + t.vlen[j]; }
     return at;
 }
 
@@ -66,7 +66,7 @@ fn hpack_entry(t: const HpackTable&, i: i64) -> const u8[:], const u8[:] {
 }
 
 fn hpack_evict_oldest(t: HpackTable&) {
-    let n = (t.nlen[0] as i64) + (t.vlen[0] as i64);
+    let n = (t.nlen[0] as i64) + t.vlen[0];
     for j in t.used - n { t.data[j] = t.data[j + n]; }
     t.used -= n;
     t.size -= n + 32;
@@ -104,7 +104,7 @@ fn hpack_resize(t: HpackTable&, n: i64) {
 fn hpack_int(b: const u8[:], pos: i64, n: i64) -> i64, i64 {
     if pos >= b.len { return 0, -1; }
     let mask = (1 << n) - 1;
-    var v = (b[pos] as i64) & mask;
+    var v = b[pos] & mask;
     var p = pos + 1;
     if v < mask { return v, p; }
     var shift = 0;
@@ -164,7 +164,7 @@ fn huffman_decode(s: const u8[:], out: u8[>..]&) -> bool {
             if len > 30 { return false; }
             let cnt = HUFF_COUNT[len] as u32;
             if cnt > 0 && code >= HUFF_FIRST[len] && code - HUFF_FIRST[len] < cnt {
-                let sym = HUFF_SYMS[(HUFF_OFFSET[len] as i64) + ((code - HUFF_FIRST[len]) as i64)];
+                let sym = HUFF_SYMS[(HUFF_OFFSET[len] as i64) + (code - HUFF_FIRST[len])];
                 if sym == 256 { return false; }
                 out.push(sym as! u8);
                 code = 0;
@@ -178,7 +178,7 @@ fn huffman_decode(s: const u8[:], out: u8[>..]&) -> bool {
 
 fn huffman_length(s: const u8[:]) -> i64 {
     var bits: i64 = 0;
-    for c in s { bits += HUFF_LEN[c] as i64; }
+    for c in s { bits += HUFF_LEN[c]; }
     return (bits + 7) / 8;
 }
 
@@ -187,7 +187,7 @@ fn huffman_encode(out: u8[>..]&, s: const u8[:]) {
     var n: i64 = 0;
     for c in s {
         let l = HUFF_LEN[c] as i64;
-        acc = (acc << (l as! u64)) | (HUFF_CODE[c] as u64);
+        acc = (acc << (l as! u64)) | HUFF_CODE[c];
         n += l;
         while n >= 8 {
             n -= 8;

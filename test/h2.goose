@@ -6,6 +6,12 @@
 
 import std;
 import http from "..";
+import net from "SorinS/netgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.7.0";
+import ntlm from "SorinS/ntlmgoose@v0.7.0";
 import http.hpack;
 import http.h1;
 import http.h2;
@@ -434,6 +440,8 @@ fn client_errors() {
     }
     client_case("no :status", resp("x\t1\n", 5), "RST_STREAM 1 0 4 1\n", "R 1 1 local\n");
     client_case("a bad :status", resp(":status\t2x0\n", 5), "RST_STREAM 1 0 4 1\n", "R 1 1 local\n");
+    // A long run of digits is refused by its length, before it can overflow.
+    client_case("a 30-digit :status", resp(":status\t999999999999999999999999999999\n", 5), "RST_STREAM 1 0 4 1\n", "R 1 1 local\n");
     client_case("a request pseudo-header", resp(":status\t200\n:path\t/\n", 5), "RST_STREAM 1 0 4 1\n", "R 1 1 local\n");
     client_case("a 1xx ending the stream", resp(":status\t100\n", 5), "RST_STREAM 1 0 4 1\n", "R 1 1 local\n");
     client_case("a 200", resp(":status\t200\n", 5), "", "H 1 es: :status: 200|\n");

@@ -5,7 +5,7 @@
 // (publicsuffix.org's format), and the cookie files of curl and Netscape.
 //
 //   var jar = http::new_jar();
-//   http::jar_set_cookies(jar, psl, u, "id=7; Path=/; Max-Age=3600", now_ms);
+//   http::jar_set_cookie(jar, psl, u, "id=7; Path=/; Max-Age=3600", now_ms);
 //   var line: u8[>..] = [];
 //   http::jar_cookie_header(jar, psl, u, now_ms, line);   // "id=7"
 //
@@ -302,7 +302,7 @@ fn psl_hash(rule: const u8[:]) -> u64 {
 
 fn psl_slot(p: const Psl&, k: i64) -> i64 {
     let at = p.text_len + k * 4;
-    return (p.rules[at] as i64) | ((p.rules[at + 1] as i64) << 8) | ((p.rules[at + 2] as i64) << 16) | ((p.rules[at + 3] as i64) << 24);
+    return p.rules[at] | ((p.rules[at + 1] as i64) << 8) | ((p.rules[at + 2] as i64) << 16) | ((p.rules[at + 3] as i64) << 24);
 }
 
 // The table for the text: at least twice as many slots as rules.
@@ -812,7 +812,8 @@ fn jar_load_netscape(j: Jar&, p: const Psl&, text: const u8[:], now_ms: i64) -> 
                     if parts[3] == "TRUE" { flags |= CK_SECURE; }
                     if http_only { flags |= CK_HTTP_ONLY; }
                     var expires = END_OF_TIME_MS;
-                    if exp_s > 0 { flags |= CK_PERSISTENT; expires = exp_s * 1000; }
+                    // No later than END_OF_TIME_MS: a huge expiry must not overflow.
+                    if exp_s > 0 { flags |= CK_PERSISTENT; expires = if exp_s >= END_OF_TIME_MS / 1000 { END_OF_TIME_MS } else { exp_s * 1000 }; }
                     if exp_s <= 0 || expires > now_ms {
                         var low: u8[>..] = [];
                         for ch in domain { low.push(lower(ch)); }

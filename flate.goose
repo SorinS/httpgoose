@@ -9,6 +9,10 @@
 //   let e = http::inflate_feed(d, chunk, out);    // 0, or < 0 for an error
 //   // at the body's end: http::inflate_done(d) says whether the stream was whole
 //
+// A limit on out's length (inflate_feed's `limit`) stops a small input
+// that inflates a thousandfold from being decoded whole before anyone
+// looks: past it, decoding stops with FLATE_ERR_LIMIT.
+//
 // Huffman codes are decoded a bit at a time, as zlib's puff.c does: correct
 // first. Input that ends inside a symbol (or a block's header) is kept
 // until more comes, in a buffer of fixed size: input is taken a slice at a
@@ -29,6 +33,7 @@ let FLATE_ERR_HEADER: i64 = -1;     // not a gzip or zlib header
 let FLATE_ERR_DATA: i64 = -2;       // the DEFLATE data is not valid
 let FLATE_ERR_CHECK: i64 = -3;      // a CRC-32, Adler-32 or length that does not match
 let FLATE_ERR_TRAILING: i64 = -4;   // bytes after the stream that are not another gzip member
+let FLATE_ERR_LIMIT: i64 = -5;      // the output passed inflate_feed's limit
 
 let FS_HEADER: u8 = 0;
 let FS_BLOCK: u8 = 1;               // at a block's header
@@ -68,6 +73,7 @@ struct Inflate {
     gh_flags: u8,
     gh_left: i64,                   // FEXTRA's bytes still to skip
     gh_crc: u32,                    // CRC-32 of the header so far (for FHCRC)
+    limit: i64,                     // the most out may hold (inflate_feed's), or -1
     pending: u8[..2048],            // input not used yet, from pending[0] bit `bit`
 }
 
@@ -78,7 +84,7 @@ fn new_inflate(format: u8) -> Inflate {
         format: format, state: if format == FLATE_RAW { FS_BLOCK } else { FS_HEADER }, last: false, stored_left: 0,
         bit: 0, lencode: new_huffman(), distcode: new_huffman(), window: [0; 32768], wpos: 0, wfull: false,
         crc: 0xffffffff, adler: 1, size: 0, members: 0,
-        gh: GH_FIXED, gh_flags: 0, gh_left: 0, gh_crc: 0, pending: [],
+        gh: GH_FIXED, gh_flags: 0, gh_left: 0, gh_crc: 0, limit: -1, pending: [],
     }
 }
 
@@ -154,7 +160,7 @@ fn decode_symbol(d: const Inflate&, b: Bits&, h: const Huffman&) -> i64 {
         code |= need(d, b, 1);
         if !b.ok { return -1; }
         let count = h.count[len] as i64;
-        if code - count < first { return h.symbol[index + (code - first)] as i64; }
+        if code - count < first { return h.symbol[index + (code - first)]; }
         index += count;
         first += count;
         first <<= 1;
@@ -168,15 +174,15 @@ fn decode_symbol(d: const Inflate&, b: Bits&, h: const Huffman&) -> i64 {
 fn construct(h: Huffman&, lengths: const i16[:]) -> i64 {
     for k in 16 { h.count[k] = 0; }
     for l in lengths { h.count[l]++; }
-    if h.count[0] as i64 == lengths.len { return 0; }
+    if h.count[0] == lengths.len { return 0; }
     var left: i64 = 1;
     for len in 1..MAXBITS + 1 {
         left <<= 1;
-        left -= h.count[len] as i64;
+        left -= h.count[len];
         if left < 0 { return left; }
     }
     var offs: i64[16] = [0; 16];
-    for len in 1..MAXBITS { offs[len + 1] = offs[len] + h.count[len] as i64; }
+    for len in 1..MAXBITS { offs[len + 1] = offs[len] + h.count[len]; }
     for sym in lengths.len {
         let l = lengths[sym];
         if l != 0 {
@@ -223,8 +229,8 @@ fn block_header(d: Inflate&) -> i64 {
         // Stored: to a byte boundary, then LEN and NLEN.
         if b.bit != 0 { b.bit = 0; b.pos++; }
         if b.pos + 4 > d.pending.len { return 0; }
-        let len = d.pending[b.pos] as i64 | (d.pending[b.pos + 1] as i64) << 8;
-        let nlen = d.pending[b.pos + 2] as i64 | (d.pending[b.pos + 3] as i64) << 8;
+        let len = d.pending[b.pos] | (d.pending[b.pos + 1] as i64) << 8;
+        let nlen = d.pending[b.pos + 2] | (d.pending[b.pos + 3] as i64) << 8;
         if len != (nlen ^ 0xffff) { return FLATE_ERR_DATA; }
         b.pos += 4;
         commit(d, b);
@@ -287,9 +293,9 @@ fn block_header(d: Inflate&) -> i64 {
         if lengths[256] == 0 { return FLATE_ERR_DATA; }      // no end-of-block code
         // An incomplete code is allowed only for a single length of one bit.
         let e1 = construct(d.lencode, lengths[..nlen]);
-        if e1 < 0 || (e1 > 0 && nlen - (d.lencode.count[0] as i64) != 1) { return FLATE_ERR_DATA; }
+        if e1 < 0 || (e1 > 0 && nlen - d.lencode.count[0] != 1) { return FLATE_ERR_DATA; }
         let e2 = construct(d.distcode, lengths[nlen..nlen + ndist]);
-        if e2 < 0 || (e2 > 0 && ndist - (d.distcode.count[0] as i64) != 1) { return FLATE_ERR_DATA; }
+        if e2 < 0 || (e2 > 0 && ndist - d.distcode.count[0] != 1) { return FLATE_ERR_DATA; }
         commit(d, b);
         d.state = FS_CODES;
         return 1;
@@ -301,6 +307,7 @@ fn block_header(d: Inflate&) -> i64 {
 // error.
 fn codes(d: Inflate&, out: u8[>..]&) -> i64 {
     while true {
+        if d.limit >= 0 && out.len > d.limit { return FLATE_ERR_LIMIT; }
         var b = bits_start(d);
         let sym = decode_symbol(d, b, d.lencode);
         if !b.ok { return 0; }
@@ -316,11 +323,11 @@ fn codes(d: Inflate&, out: u8[>..]&) -> i64 {
         }
         let s = sym - 257;
         if s >= 29 { return FLATE_ERR_DATA; }
-        let len = LBASE[s] as i64 + need(d, b, LEXT[s] as i64);
+        let len = LBASE[s] + need(d, b, LEXT[s]);
         let ds = decode_symbol(d, b, d.distcode);
         if !b.ok { return 0; }
         if ds < 0 || ds >= 30 { return FLATE_ERR_DATA; }
-        let dist = DBASE[ds] as i64 + need(d, b, DEXT[ds] as i64);
+        let dist = DBASE[ds] + need(d, b, DEXT[ds]);
         if !b.ok { return 0; }
         let have = if d.wfull { 32768 } else { d.wpos };
         if dist > have { return FLATE_ERR_DATA; }
@@ -352,7 +359,7 @@ fn gzip_header(d: Inflate&) -> i64 {
         } else if d.gh == GH_XLEN {
             if (d.gh_flags & 4) == 0 { d.gh = GH_NAME; continue; }      // FEXTRA
             if m.len < 2 { return 0; }
-            d.gh_left = m[0] as i64 | (m[1] as i64) << 8;
+            d.gh_left = m[0] | (m[1] as i64) << 8;
             used = 2;
             d.gh = GH_EXTRA;
         } else if d.gh == GH_EXTRA {
@@ -378,7 +385,7 @@ fn gzip_header(d: Inflate&) -> i64 {
             if (d.gh_flags & 2) != 0 {                                      // FHCRC
                 if m.len < 2 { return 0; }
                 let c = (d.gh_crc ^ 0xffffffff) & 0xffff;
-                if c != (m[0] as u32 | (m[1] as u32) << 8) { return FLATE_ERR_CHECK; }
+                if c != (m[0] | (m[1] as u32) << 8) { return FLATE_ERR_CHECK; }
                 var b2 = Bits { pos: 2, bit: 0, ok: true };
                 commit(d, b2);
             }
@@ -415,7 +422,7 @@ fn zlib_header(d: Inflate&) -> i64 {
 }
 
 fn get_le32(m: const u8[:], p: i64) -> u32 {
-    return m[p] as u32 | (m[p + 1] as u32) << 8 | (m[p + 2] as u32) << 16 | (m[p + 3] as u32) << 24;
+    return m[p] | (m[p + 1] as u32) << 8 | (m[p + 2] as u32) << 16 | (m[p + 3] as u32) << 24;
 }
 
 // The trailer: gzip's CRC-32 and ISIZE, zlib's Adler-32, none for raw.
@@ -431,7 +438,7 @@ fn trailer(d: Inflate&) -> i64 {
         return 1;
     }
     if m.len < 4 { return 0; }
-    let want = (m[0] as u32) << 24 | (m[1] as u32) << 16 | (m[2] as u32) << 8 | m[3] as u32;
+    let want = (m[0] as u32) << 24 | (m[1] as u32) << 16 | (m[2] as u32) << 8 | m[3];
     if want != d.adler { return FLATE_ERR_CHECK; }
     var b = Bits { pos: 4, bit: 0, ok: true };
     commit(d, b);
@@ -439,9 +446,12 @@ fn trailer(d: Inflate&) -> i64 {
 }
 
 // Decodes what of `input` it can, appending to `out`: 0, or an error
-// (< 0, after which the decoder takes nothing more).
-fn inflate_feed(d: Inflate&, input: const u8[:], out: u8[>..]&) -> i64 {
+// (< 0, after which the decoder takes nothing more). With a `limit`
+// (>= 0), FLATE_ERR_LIMIT once out holds more than that: it may then hold
+// up to a match (258 bytes) or what is buffered of a stored block more.
+fn inflate_feed(d: Inflate&, input: const u8[:], out: u8[>..]&, limit: i64 = -1) -> i64 {
     if d.state == FS_FAILED { return FLATE_ERR_DATA; }
+    d.limit = limit;
     var at = 0;
     while true {
         let room = FLATE_PENDING - d.pending.len;
@@ -492,6 +502,7 @@ fn inflate_run(d: Inflate&, out: u8[>..]&) -> i64 {
             d.state = FS_HEADER;
             r = 1;
         }
+        if r >= 0 && d.limit >= 0 && out.len > d.limit { r = FLATE_ERR_LIMIT; }
         if r < 0 { d.state = FS_FAILED; return r; }
         if r == 0 { return 0; }
     }

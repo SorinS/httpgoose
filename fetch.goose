@@ -21,7 +21,8 @@
 // Credentials: a URL's userinfo goes as Basic before any challenge, as Go
 // sends it; set_credentials' go to the first URL's host and its
 // subdomains as the client's auth option says (Basic at once, or in
-// answer to a 401 with the scheme it asks for, Digest before Basic); a
+// answer to a 401 with the scheme it asks for, Digest before NTLM before
+// Basic); a
 // proxy URL's userinfo goes to the proxy as Basic, or answers its 407.
 
 namespace http;
@@ -36,8 +37,12 @@ import cookie;
 import auth;
 import flate;
 import client;
-import tls from "../tlsgoose.git";
+import tls;
 import tls.handshake;
+import ntlm;
+import ntlm.messages;
+import ntlm.client;
+import ntlm.http;
 
 // --- Settings --------------------------------------------------------------
 
@@ -274,6 +279,67 @@ fn drop_coding_fields(r: Response&) {
     r.trailer = r.body;
 }
 
+// --- NTLM (gslib's ntlm) ----------------------------------------------------
+
+// Whether a 401's challenges offer NTLM: SCHEME_NTLM for "NTLM",
+// SCHEME_NEGOTIATE for "Negotiate" alone (raw NTLMSSP goes in it), and
+// whether Digest is offered too.
+fn ntlm_offered(fields: const u8[:]) -> i64, bool {
+    var ntlm_s = false;
+    var nego = false;
+    var digest = false;
+    each_field(fields, "WWW-Authenticate") { v =>
+        each_challenge(v) { scheme, params =>
+            if eq_fold(scheme, "NTLM") { ntlm_s = true; }
+            else if eq_fold(scheme, "Negotiate") { nego = true; }
+            else if eq_fold(scheme, "Digest") { digest = true; }
+        };
+    };
+    let s = if ntlm_s { ntlm::SCHEME_NTLM } else if nego { ntlm::SCHEME_NEGOTIATE } else { ntlm::SCHEME_NONE };
+    return s, digest;
+}
+
+// The leaf certificate of the TLS connection a 401 came on, for NTLM's
+// channel binding: its slot while the body is unread, else (an empty body
+// sends the connection back to the pool at once) the idle connection to
+// its origin used last, the one the pool hands the next request.
+fn ntlm_peer_leaf(c: const Client&, r: const Response&, u: const Url&) -> u8[>..], bool {
+    var out: u8[>..] = [];
+    var best = -1;
+    if r.conn >= 0 && c.conns[r.conn].used && c.conns[r.conn].gen == r.gen {
+        best = r.conn;
+    } else {
+        var key: u8[>..] = [];
+        if !origin_key(u, key) { return out, false; }
+        for i in c.conns.len {
+            let pc: const PoolConn& = c.conns[i];
+            if pc.used && pc.idle && pc.is_tls && pc.h2 < 0 && ends_with(pc.key[..], key[..]) &&
+               (best < 0 || pc.last_used > c.conns[best].last_used) {
+                best = i;
+            }
+        }
+    }
+    if best < 0 || !c.conns[best].is_tls { return out, false; }
+    let chain = tls::peer_certificates(c.conns[best].tc);
+    let leaf, ok = ntlm::leaf_certificate(chain);
+    if ok { out.append(leaf); }
+    return out, ok;
+}
+
+// The NTLMSSP CHALLENGE in a 401's WWW-Authenticate under `scheme`.
+fn ntlm_challenge(fields: const u8[:], scheme: i64) -> u8[>..], bool {
+    var out: u8[>..] = [];
+    var found = false;
+    each_field(fields, "WWW-Authenticate") { v =>
+        let s, tok, ok = ntlm::http_token(v);
+        if !found && ok && s == scheme && ntlm::is_ntlmssp(tok) {
+            out.append(tok);
+            found = true;
+        }
+    };
+    return out, found;
+}
+
 // A request with the client's policy: the response with its head read and
 // its body to read (read_body, read_all), or r.err set. A redirect that
 // cannot be followed past max_redirects gives the last response with
@@ -316,6 +382,9 @@ fn fetch_core<F>(c: Client&, method0: const u8[:], url_text: const u8[:], fields
     var auth_tried = false;
     var proxy_tried = false;
     var consumed = false;           // some of a streamed body has been read
+    var ntlm_step = 0;              // NTLM: 1 when the NEGOTIATE went, 2 the AUTHENTICATE
+    var ntlm_scheme = ntlm::SCHEME_NONE;
+    var ntlm_ctx = ntlm::initiator(ntlm::anonymous_credentials(), "", 0);
     while true {
         // This hop's fields.
         var f = copy_fields(fields, strip_sensitive, !include_body);
@@ -430,6 +499,59 @@ fn fetch_core<F>(c: Client&, method0: const u8[:], url_text: const u8[:], fields
             let now = wall_ms();
             each_field(response_fields(r), "Set-Cookie") { v => jar_set_cookie(c.jar, c.psl, cur, v, now); };
         }
+        // NTLM's CHALLENGE, on the connection that took the NEGOTIATE: the
+        // AUTHENTICATE goes on it too (the body read, the connection back
+        // in the pool and taken again). Over https its certificate is the
+        // channel binding.
+        if r.status == 401 && ntlm_step == 1 {
+            ntlm_step = 3;
+            let tok, has_tok = ntlm_challenge(response_fields(r), ntlm_scheme);
+            // Over https, no certificate to bind to: not answered (the 401
+            // stands) rather than sent unbound.
+            var bound = !url_https(cur);
+            if has_tok && !r.h2 && resend_ok && !bound {
+                let leaf, lok = ntlm_peer_leaf(c, r, cur);
+                if lok {
+                    let cb, cbok = ntlm::tls_server_end_point(leaf);
+                    if cbok { ntlm::set_channel_bindings(ntlm_ctx, cb); bound = true; }
+                }
+            }
+            if has_tok && !r.h2 && resend_ok && bound {
+                var t3: u8[>..] = [];
+                if ntlm::authenticate(ntlm_ctx, tok, time_ns() / 1000000000, t3) == ntlm::OK {
+                    // The body read whole (not close_body's 2 KB), so the
+                    // connection goes back to the pool for the AUTHENTICATE.
+                    read_all(c, r);
+                    authz.clear();
+                    authz.append(ntlm::http_header(ntlm_scheme, t3));
+                    ntlm_step = 2;
+                    continue;
+                }
+            }
+        }
+        // NTLM offered, and wanted (AUTH_NTLM, or AUTH_ANY with no Digest):
+        // the NEGOTIATE.
+        if r.status == 401 && !auth_tried && have && ntlm_step == 0 && !r.h2 && resend_ok &&
+           (mode == AUTH_NTLM || mode == AUTH_ANY) {
+            let scheme, digest = ntlm_offered(response_fields(r));
+            if scheme != ntlm::SCHEME_NONE && (mode == AUTH_NTLM || !digest) {
+                let cred, ce = ntlm::credentials(user, "", pass);
+                var spn: u8[>..] = [];
+                spn.append("HTTP/");
+                spn.append(url_host(cur));
+                ntlm_ctx = ntlm::initiator(cred, spn, 0);
+                var t1: u8[>..] = [];
+                if ce == ntlm::OK && ntlm::negotiate(ntlm_ctx, t1) == ntlm::OK {
+                    read_all(c, r);
+                    authz.clear();
+                    authz.append(ntlm::http_header(scheme, t1));
+                    auth_tried = true;
+                    ntlm_step = 1;
+                    ntlm_scheme = scheme;
+                    continue;
+                }
+            }
+        }
         // A Digest answer refused: the challenge is not answered again
         // unasked.
         if r.status == 401 && auth_tried && c.digest_params.len > 0 { forget_digest(c); }
@@ -524,6 +646,7 @@ fn fetch_core<F>(c: Client&, method0: const u8[:], url_text: const u8[:], fields
         redirects++;
         authz.clear();
         auth_tried = false;
+        ntlm_step = 0;
     }
     return empty_response(ERR_IO);
 }

@@ -1,8 +1,8 @@
 /* The operating system's part of tools/httpd.goose and tools/http.goose:
-   TCP sockets, waiting on one descriptor, processes for connections, and
-   resolving paths. POSIX: macOS and Linux. Each function returns -1 (or a
-   negative value) on failure; strings arrive as Goose slices,
-   { data, len }, not NUL-terminated. */
+   TCP sockets, waiting on one descriptor, and resolving paths. POSIX:
+   macOS and Linux. Each function returns -1 (or a negative value) on
+   failure; strings arrive as Goose slices, { data, len }, not
+   NUL-terminated. */
 
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
@@ -21,7 +21,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 typedef struct { const uint8_t *data; int64_t len; } net_slice;
@@ -111,15 +110,33 @@ int64_t net_read(int32_t fd, net_buf buf) {
     return n;
 }
 
-/* All of data, or -1. */
+/* How long net_write waits for a peer that takes nothing (ms): a client
+   that stops reading would otherwise hold its connection's thread for
+   ever. As long as tools/httpd.goose waits for a request (IDLE_MS). */
+#define WRITE_STALL_MS 30000
+
+/* All of data, or -1, also when the peer has taken nothing for
+   WRITE_STALL_MS. The socket is non-blocking while it writes: POLLOUT
+   means room for some of it, and a blocking write waits for room for
+   all. */
 int64_t net_write(int32_t fd, net_slice data) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
     int64_t off = 0;
     while (off < data.len) {
         ssize_t n = write(fd, data.data + off, (size_t)(data.len - off));
+        if (n > 0) { off += n; continue; }
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return -1;
-        off += n;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd p = { fd, POLLOUT, 0 };
+            int r;
+            do { r = poll(&p, 1, WRITE_STALL_MS); } while (r < 0 && errno == EINTR);
+            if (r > 0) continue;
+        }
+        off = -1;
+        break;
     }
+    fcntl(fd, F_SETFL, fl);
     return off;
 }
 
@@ -133,13 +150,6 @@ int32_t net_wait(int32_t fd, int32_t timeout_ms) {
     do { r = poll(&p, 1, timeout_ms); } while (r < 0 && errno == EINTR);
     return r;
 }
-
-/* fork(), the child with default SIGCHLD; -1 on failure. */
-int32_t proc_fork(void) { return fork(); }
-void proc_exit(int32_t code) { _exit(code); }
-
-/* Reaps children that have exited, without waiting. */
-void proc_reap(void) { while (waitpid(-1, NULL, WNOHANG) > 0) {} }
 
 /* The canonical absolute path of an existing path (symbolic links
    resolved), or -1. */
